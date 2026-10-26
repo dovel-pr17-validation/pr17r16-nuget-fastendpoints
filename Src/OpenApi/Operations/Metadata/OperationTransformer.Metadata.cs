@@ -1,0 +1,290 @@
+using System.Globalization;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Metadata;
+using Microsoft.OpenApi;
+
+namespace FastEndpoints.OpenApi;
+
+sealed partial class OperationMetadataTransformer(DocumentOptions docOpts, SharedContext sharedCtx)
+{
+    static readonly TextInfo _textInfo = CultureInfo.InvariantCulture.TextInfo;
+    JsonSerializerOptions SerializerOptions => sharedCtx.SerializerOptions ?? Cfg.SerOpts.Options;
+
+    public void ApplyAutoTag(OpenApiOperation operation, EndpointDefinition epDef, string bareRoute, IList<object> metadata)
+    {
+        List<string>? explicitTagNames = null;
+        HashSet<string>? explicitTags = null;
+        string? overrideVal = null;
+
+        for (var i = 0; i < metadata.Count; i++)
+        {
+            switch (metadata[i])
+            {
+                case ITagsMetadata tagsMetadata:
+                {
+                    explicitTagNames ??= [];
+                    explicitTags ??= new(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var tagName in tagsMetadata.Tags)
+                    {
+                        if (tagName is null)
+                            continue;
+
+                        explicitTagNames.Add(tagName);
+                        explicitTags.Add(tagName);
+                    }
+
+                    break;
+                }
+                case AutoTagOverride autoTagOverride:
+                    overrideVal = autoTagOverride.TagName;
+
+                    break;
+            }
+        }
+
+        // always strip framework-generated tags (controller/assembly name) that weren't set via WithTags
+        if (operation.Tags is { Count: > 0 })
+        {
+            foreach (var t in operation.Tags.ToArray())
+            {
+                if (t.Name is null || explicitTags?.Contains(t.Name) is not true)
+                    operation.Tags.Remove(t);
+            }
+        }
+
+        HashSet<string>? emitted = null;
+
+        if (explicitTagNames is not null)
+        {
+            for (var i = 0; i < explicitTagNames.Count; i++)
+                AddTag(explicitTagNames[i]);
+        }
+
+        if (docOpts.AutoTagPathSegmentIndex <= 0 || epDef.DontAutoTagEndpoints)
+            return;
+
+        string? tag = null;
+
+        if (overrideVal is not null)
+            tag = TagName(overrideVal, docOpts.TagCase, docOpts.TagStripSymbols);
+        else
+        {
+            var segments = bareRoute.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+            if (segments.Length >= docOpts.AutoTagPathSegmentIndex)
+                tag = TagName(segments[docOpts.AutoTagPathSegmentIndex - 1], docOpts.TagCase, docOpts.TagStripSymbols);
+        }
+
+        if (tag is not null)
+            AddTag(tag);
+
+        // ordinal membership keeps caller spelling, including names that differ only by case.
+        // OpenApiTagReference equality is referential, so the set is what prevents duplicate names.
+        void AddTag(string tagName)
+        {
+            if (tagName.Length == 0)
+                return;
+
+            if (emitted is null)
+            {
+                operation.Tags ??= new HashSet<OpenApiTagReference>();
+                emitted = new(StringComparer.Ordinal);
+
+                foreach (var existing in operation.Tags)
+                {
+                    if (existing.Name is not null)
+                        emitted.Add(existing.Name);
+                }
+            }
+
+            if (emitted.Add(tagName))
+                operation.Tags!.Add(new(tagName));
+        }
+    }
+
+    public void AddIdempotencyHeader(OpenApiOperation operation, EndpointDefinition epDef, OpenApiGenerationState generation)
+    {
+        if (!TryGetIdempotencyHeader(epDef, out var headerName, out var description, out var exampleGenerator, out var headerType))
+            return;
+
+        if (OperationParameterCollection.Has(operation, ParameterLocation.Header, headerName))
+            return;
+
+        var exampleValue = exampleGenerator?.Invoke();
+        var exampleNode = exampleValue.JsonNodeFromObject(SerializerOptions);
+
+        OperationParameterCollection.Add(
+            operation,
+            new()
+            {
+                Name = headerName,
+                In = ParameterLocation.Header,
+                Required = true,
+                Description = description,
+                Schema = headerType is not null
+                             ? headerType.GetSchemaForType(sharedCtx, generation, docOpts.ShortSchemaNames)
+                             : OperationSchemaHelpers.CreateSchemaFromExampleNode(exampleNode) ?? OperationSchemaHelpers.StringSchema(),
+                Example = exampleNode
+            });
+    }
+
+    static bool TryGetIdempotencyHeader(EndpointDefinition epDef, out string headerName, out string? description, out Func<object>? exampleGenerator, out Type? headerType)
+    {
+        if (epDef.IdempotencyOptions is not null)
+        {
+            headerName = epDef.IdempotencyOptions.HeaderName;
+            description = epDef.IdempotencyOptions.SwaggerHeaderDescription;
+            exampleGenerator = epDef.IdempotencyOptions.SwaggerExampleGenerator;
+            headerType = epDef.IdempotencyOptions.SwaggerHeaderType;
+
+            return true;
+        }
+
+        if (epDef.FinancialIdempotencyOptions is not null)
+        {
+            headerName = epDef.FinancialIdempotencyOptions.HeaderName;
+            description = epDef.FinancialIdempotencyOptions.SwaggerHeaderDescription;
+            exampleGenerator = epDef.FinancialIdempotencyOptions.SwaggerExampleGenerator;
+            headerType = epDef.FinancialIdempotencyOptions.SwaggerHeaderType;
+
+            return true;
+        }
+
+        headerName = null!;
+        description = null;
+        exampleGenerator = null;
+        headerType = null;
+
+        return false;
+    }
+
+    public void AddX402Headers(OpenApiOperation operation, EndpointDefinition epDef)
+    {
+        if (epDef.X402PaymentMetadata is null)
+            return;
+
+        if (!OperationParameterCollection.Has(operation, ParameterLocation.Header, X402Constants.PaymentSignatureHeader))
+        {
+            OperationParameterCollection.Add(
+                operation,
+                new()
+                {
+                    Name = X402Constants.PaymentSignatureHeader,
+                    In = ParameterLocation.Header,
+                    Required = false,
+                    Description = "Base64-encoded x402 payment payload.",
+                    Schema = OperationSchemaHelpers.StringSchema()
+                });
+        }
+
+        if (operation.Responses is null)
+            return;
+
+        foreach (var (statusCode, response) in operation.Responses)
+        {
+            if (response is not OpenApiResponse concreteResponse)
+                continue;
+
+            if (statusCode == "402")
+            {
+                concreteResponse.AddHeader(
+                    X402Constants.PaymentRequiredHeader,
+                    new()
+                    {
+                        Description = "Base64-encoded x402 payment challenge payload.",
+                        Schema = OperationSchemaHelpers.StringSchema()
+                    });
+            }
+
+            concreteResponse.AddHeader(
+                X402Constants.PaymentResponseHeader,
+                new()
+                {
+                    Description = "Base64-encoded x402 settlement result. Present when the middleware attempts settlement.",
+                    Schema = OperationSchemaHelpers.StringSchema()
+                });
+        }
+    }
+
+    public void ApplySecurityRequirements(OpenApiOperation operation, EndpointDefinition? epDef, IList<object> metadata, string operationKey, OpenApiGenerationState generation)
+    {
+        var authorizeAttributes = new List<AuthorizeAttribute>();
+        var hasAllowAnonymous = false;
+
+        for (var i = 0; i < metadata.Count; i++)
+        {
+            switch (metadata[i])
+            {
+                case AllowAnonymousAttribute:
+                    hasAllowAnonymous = true;
+
+                    break;
+                case AuthorizeAttribute authorizeAttribute:
+                    authorizeAttributes.Add(authorizeAttribute);
+
+                    break;
+            }
+        }
+
+        if (hasAllowAnonymous || authorizeAttributes.Count == 0)
+        {
+            operation.Security?.Clear();
+
+            return;
+        }
+
+        var securityEntries = BuildSecurityRequirements(epDef);
+
+        if (securityEntries.Length > 0)
+            generation.SecurityRequirements[operationKey] = securityEntries;
+    }
+
+    (string SchemeName, string[] Scopes)[] BuildSecurityRequirements(EndpointDefinition? epDef)
+    {
+        var securityEntries = new List<(string SchemeName, string[] Scopes)>();
+
+        foreach (var authConfig in docOpts.AuthSchemes)
+        {
+            if (epDef is not null)
+            {
+                var epSchemes = epDef.AuthSchemeNames;
+
+                if (epSchemes?.Contains(authConfig.Name) == false)
+                    continue;
+            }
+
+            var scopes = new HashSet<string>(StringComparer.Ordinal);
+
+            if (authConfig.GlobalScopes is not null)
+            {
+                foreach (var scope in authConfig.GlobalScopes)
+                    scopes.Add(scope);
+            }
+
+            securityEntries.Add((authConfig.Name, [.. scopes]));
+        }
+
+        return [.. securityEntries];
+    }
+
+    static string TagName(string input, TagCase tagCase, bool stripSymbols)
+    {
+        return StripSymbols(
+            tagCase switch
+            {
+                TagCase.None => input,
+                TagCase.TitleCase => _textInfo.ToTitleCase(input),
+                TagCase.LowerCase => _textInfo.ToLower(input),
+                _ => input
+            });
+
+        string StripSymbols(string val)
+            => stripSymbols ? TagSymbolsRegex().Replace(val, "") : val;
+    }
+
+    [GeneratedRegex("[^a-zA-Z0-9]")]
+    private static partial Regex TagSymbolsRegex();
+}

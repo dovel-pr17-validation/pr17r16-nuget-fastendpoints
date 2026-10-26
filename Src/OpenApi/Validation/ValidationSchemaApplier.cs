@@ -1,0 +1,347 @@
+using System.Collections.ObjectModel;
+using System.Diagnostics.CodeAnalysis;
+using FastEndpoints.OpenApi.ValidationProcessor;
+using FastEndpoints.OpenApi.ValidationProcessor.Extensions;
+using FluentValidation;
+using FluentValidation.Validators;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.OpenApi;
+using static FastEndpoints.OpenApi.ValidationSchemaMutation;
+
+namespace FastEndpoints.OpenApi;
+
+sealed class ValidationSchemaApplier : IDisposable
+{
+    readonly SharedContext _sharedCtx;
+    readonly OperationSchemaMutationContext _mutationCtx;
+    readonly ILogger<ValidationSchemaTransformer>? _logger;
+    readonly FluentValidationRule[] _rules;
+    readonly ChildValidatorResolver _childResolver;
+    readonly bool _localizeReferencedSchemas;
+    readonly bool _usePropertyNamingPolicy;
+    readonly string _schemaKey;
+
+    public ValidationSchemaApplier(SharedContext sharedCtx,
+                                   OpenApiGenerationState generation,
+                                   IServiceResolver serviceResolver,
+                                   ILogger<ValidationSchemaTransformer>? logger,
+                                   Func<IServiceScope> createScope,
+                                   FluentValidationRule[] rules,
+                                   bool usePropertyNamingPolicy,
+                                   string operationKey,
+                                   string schemaKey,
+                                   bool localizeReferencedSchemas = false)
+    {
+        _sharedCtx = sharedCtx;
+        _mutationCtx = new(sharedCtx, generation, operationKey);
+        _logger = logger;
+        _rules = rules;
+        _usePropertyNamingPolicy = usePropertyNamingPolicy;
+        _schemaKey = schemaKey;
+        _localizeReferencedSchemas = localizeReferencedSchemas;
+        _childResolver = new(serviceResolver, logger, createScope);
+    }
+
+    public void Dispose()
+        => _childResolver.Dispose();
+
+    public void ApplyValidatorRules(OpenApiSchema schema, CachedValidatorRules cachedRules, string propertyPrefix, HashSet<Type> activeChildValidators)
+    {
+        ApplyRulesToSchema(schema, new(cachedRules.Rules), propertyPrefix, activeChildValidators);
+
+        foreach (var includedRules in cachedRules.IncludedRules)
+            ApplyValidatorRules(schema, includedRules, propertyPrefix, activeChildValidators);
+    }
+
+    void ApplyValidator(OpenApiSchema schema, IValidator validator, string propertyPrefix, HashSet<Type> activeChildValidators)
+    {
+        var rules = ValidatorRuleTreeReader.Read(validator, _sharedCtx.NamingPolicy, _usePropertyNamingPolicy, _logger);
+        ApplyValidatorRules(schema, rules, propertyPrefix, activeChildValidators);
+    }
+
+    void ApplyRulesToSchema(OpenApiSchema? schema, ValidationRuleLookup rules, string propertyPrefix, HashSet<Type> activeChildValidators)
+    {
+        if (schema is null)
+            return;
+
+        TryApplyRootValidation(schema, rules, propertyPrefix, activeChildValidators);
+
+        if (schema.Properties is not null)
+        {
+            foreach (var (propertyName, propertySchema) in schema.Properties.ToArray())
+                TryApplyValidation(schema, rules, propertyName, propertySchema, propertyPrefix, activeChildValidators);
+        }
+
+        RecurseComposite(schema, schema.AllOf, rules, propertyPrefix, activeChildValidators);
+        RecurseComposite(schema, schema.OneOf, rules, propertyPrefix, activeChildValidators);
+        RecurseComposite(schema, schema.AnyOf, rules, propertyPrefix, activeChildValidators);
+    }
+
+    void RecurseComposite(OpenApiSchema schema,
+                          IList<IOpenApiSchema>? composite,
+                          ValidationRuleLookup rules,
+                          string propertyPrefix,
+                          HashSet<Type> activeChildValidators)
+    {
+        if (composite is null)
+            return;
+
+        Dictionary<string, List<string>>? mappingKeysByTarget = null;
+
+        for (var i = 0; i < composite.Count; i++)
+        {
+            var originalId = (composite[i] as OpenApiSchemaReference)?.GetReferenceId();
+            var resolved = ResolveForMutation(
+                composite[i],
+                _localizeReferencedSchemas,
+                _mutationCtx,
+                $"{_schemaKey}.{propertyPrefix}.composite[{i}]",
+                localized =>
+                {
+                    composite[i] = localized;
+
+                    if (originalId is null ||
+                        localized is not OpenApiSchemaReference localizedRef ||
+                        localizedRef.GetReferenceId() is not { } localizedId ||
+                        schema.Discriminator?.Mapping is not { Count: > 0 } mapping)
+                        return;
+
+                    // Build once, then track retargets so repeated branch IDs keep sequential semantics.
+                    if (mappingKeysByTarget is null)
+                    {
+                        mappingKeysByTarget = new(StringComparer.Ordinal);
+
+                        foreach (var (key, reference) in mapping)
+                        {
+                            if (reference.GetReferenceId() is not { } targetId)
+                                continue;
+
+                            if (!mappingKeysByTarget.TryGetValue(targetId, out var targetKeys))
+                                mappingKeysByTarget[targetId] = targetKeys = [];
+
+                            targetKeys.Add(key);
+                        }
+                    }
+
+                    if (!mappingKeysByTarget.Remove(originalId, out var keys))
+                        return;
+
+                    // Replace values, never mutate references shared with other operations.
+                    foreach (var key in keys)
+                        mapping[key] = mapping[key].RetargetTo(localizedId);
+
+                    if (mappingKeysByTarget.TryGetValue(localizedId, out var localizedKeys))
+                        localizedKeys.AddRange(keys);
+                    else
+                        mappingKeysByTarget[localizedId] = keys;
+                });
+
+            if (resolved?.Properties is { Count: > 0 })
+                ApplyRulesToSchema(resolved, rules, propertyPrefix, activeChildValidators);
+        }
+    }
+
+    void TryApplyValidation(OpenApiSchema schema,
+                            ValidationRuleLookup rules,
+                            string propertyName,
+                            IOpenApiSchema? property,
+                            string parameterPrefix,
+                            HashSet<Type> activeChildValidators)
+    {
+        var fullPropertyName = $"{parameterPrefix}{propertyName}";
+
+        if (rules.TryGetValue(fullPropertyName, out var validationRules))
+        {
+            var localizedPropertySchema = property is null
+                                              ? null
+                                              : ResolveForMutation(
+                                                  property,
+                                                  _localizeReferencedSchemas,
+                                                  _mutationCtx,
+                                                  $"{_schemaKey}.{fullPropertyName}",
+                                                  localized => schema.Properties![propertyName] = localized);
+
+            foreach (var validationRule in validationRules)
+                ApplyValidationRule(schema, validationRule, propertyName, fullPropertyName, localizedPropertySchema, activeChildValidators);
+        }
+
+        if (property is null)
+            return;
+
+        var hasNestedObjectRules = rules.HasPrefix($"{fullPropertyName}.");
+        var hasNestedArrayRules = rules.HasPrefix($"{fullPropertyName}[].");
+
+        if (!hasNestedObjectRules && !hasNestedArrayRules)
+            return;
+
+        var propertySchema = ResolveForMutation(
+            property,
+            _localizeReferencedSchemas,
+            _mutationCtx,
+            $"{_schemaKey}.{fullPropertyName}",
+            localized => schema.Properties![propertyName] = localized);
+
+        if (hasNestedObjectRules &&
+            propertySchema is not null &&
+            propertySchema.Properties is { Count: > 0 } &&
+            propertySchema != schema)
+        {
+            ApplyRulesToSchema(propertySchema, rules, $"{fullPropertyName}.", activeChildValidators);
+
+            return;
+        }
+
+        if (hasNestedArrayRules &&
+            ResolveArrayItemsForMutation(
+                propertySchema,
+                _localizeReferencedSchemas,
+                _mutationCtx,
+                _schemaKey,
+                fullPropertyName) is { Properties.Count: > 0 } itemsSchema)
+            ApplyRulesToSchema(itemsSchema, rules, $"{fullPropertyName}[].", activeChildValidators);
+    }
+
+    void TryApplyRootValidation(OpenApiSchema schema,
+                                ValidationRuleLookup rules,
+                                string propertyPrefix,
+                                HashSet<Type> activeChildValidators)
+    {
+        if (propertyPrefix.Length == 0 ||
+            !rules.TryGetValue(propertyPrefix.TrimEnd('.'), out var validationRules))
+            return;
+
+        foreach (var validationRule in validationRules)
+        {
+            foreach (var ruleComponent in validationRule.Components)
+            {
+                var propertyValidator = ruleComponent.Validator;
+
+                if (propertyValidator.Name == "ChildValidatorAdaptor")
+                    _childResolver.ApplyChildValidator(
+                        propertyValidator,
+                        activeChildValidators,
+                        validator => ApplyValidator(schema, validator, string.Empty, activeChildValidators));
+            }
+        }
+    }
+
+    void ApplyValidationRule(OpenApiSchema schema,
+                             IValidationRule validationRule,
+                             string propertyName,
+                             string fullPropertyName,
+                             OpenApiSchema? propertySchema,
+                             HashSet<Type> activeChildValidators)
+    {
+        var ruleHasCondition = !validationRule.HasNoCondition();
+        var isCollectionRule = validationRule.IsCollectionRule(out var hasFilter);
+        // Filtered rules validate selected elements, so their constraints cannot apply to every item.
+        if (hasFilter)
+            return;
+
+        OpenApiSchema? itemsSchema = null;
+
+        foreach (var ruleComponent in validationRule.Components)
+        {
+            var propertyValidator = ruleComponent.Validator;
+            var hasCondition = ruleHasCondition || ruleComponent.HasCondition();
+
+            if (propertyValidator.Name == "ChildValidatorAdaptor")
+            {
+                ApplyChildValidator(propertySchema, propertyName, propertyValidator, activeChildValidators);
+
+                continue;
+            }
+
+            if (isCollectionRule)
+            {
+                // Conditional components cannot constrain every item unconditionally.
+                if (hasCondition)
+                    continue;
+
+                // RuleForEach() validators constrain each item without requiring the collection property.
+                itemsSchema ??= ResolveItemsSchema(propertySchema, fullPropertyName);
+
+                if (itemsSchema is not null)
+                    ApplyMatchingRules(new(schema, propertyName, propertyValidator, hasCondition, itemsSchema) { RequiredPropertyOwner = null });
+
+                continue;
+            }
+
+            ApplyMatchingRules(new(schema, propertyName, propertyValidator, hasCondition, propertySchema));
+        }
+    }
+
+    void ApplyChildValidator(OpenApiSchema? propertySchema,
+                             string propertyName,
+                             IPropertyValidator propertyValidator,
+                             HashSet<Type> activeChildValidators)
+    {
+        _childResolver.ApplyChildValidator(propertyValidator, activeChildValidators, validator =>
+        {
+            if (propertySchema is null)
+                return;
+
+            var childSchema = ResolveArrayItemsForMutation(
+                                  propertySchema,
+                                  _localizeReferencedSchemas,
+                                  _mutationCtx,
+                                  _schemaKey,
+                                  propertyName) ?? propertySchema;
+
+            ApplyValidator(childSchema, validator, string.Empty, activeChildValidators);
+        });
+    }
+
+    void ApplyMatchingRules(RuleContext context)
+    {
+        foreach (var rule in _rules)
+        {
+            if (!rule.Matches(context.PropertyValidator))
+                continue;
+
+            try
+            {
+                rule.Apply(context);
+            }
+            catch (Exception ex)
+            {
+                _logger?.FailedToApplyValidationRule(ex, context.PropertyKey, context.PropertyValidator.Name);
+            }
+        }
+    }
+
+    OpenApiSchema? ResolveItemsSchema(OpenApiSchema? propertySchema, string fullPropertyName)
+        => ValidationSchemaMutation.ResolveItemsSchema(
+            propertySchema,
+            _localizeReferencedSchemas,
+            _mutationCtx,
+            _schemaKey,
+            fullPropertyName);
+
+    internal readonly struct ValidationRuleLookup(ReadOnlyDictionary<string, List<IValidationRule>> rules)
+    {
+        readonly HashSet<string> _prefixes = BuildPrefixes(rules.Keys);
+
+        public bool TryGetValue(string propertyName, [NotNullWhen(true)] out List<IValidationRule>? validationRules)
+            => rules.TryGetValue(propertyName, out validationRules);
+
+        public bool HasPrefix(string prefix)
+            => _prefixes.Contains(prefix);
+
+        static HashSet<string> BuildPrefixes(IEnumerable<string> ruleNames)
+        {
+            var prefixes = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var ruleName in ruleNames)
+            {
+                for (var separatorIndex = ruleName.IndexOf('.');
+                     separatorIndex >= 0;
+                     separatorIndex = ruleName.IndexOf('.', separatorIndex + 1))
+                    prefixes.Add(ruleName[..(separatorIndex + 1)]);
+            }
+
+            return prefixes;
+        }
+    }
+}

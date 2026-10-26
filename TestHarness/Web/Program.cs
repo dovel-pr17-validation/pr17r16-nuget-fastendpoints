@@ -1,0 +1,180 @@
+using System.Globalization;
+using Scalar.AspNetCore;
+using TestCases.ClientStreamingTest;
+using TestCases.CommandBusTest;
+using TestCases.CommandHandlerTest;
+using TestCases.EventHandlingTest;
+using TestCases.EventQueueTest;
+using TestCases.GlobalGenericProcessorTest;
+using TestCases.JobQueueTest;
+using TestCases.KeyedServicesTests;
+using TestCases.MetadataRegistrationTest;
+using TestCases.ProcessorStateTest;
+using TestCases.ServerStreamingTest;
+using TestCases.StreamCommandBusTest;
+using TestCases.UnitTestConcurrencyTest;
+using TestCases.X402;
+using Web;
+using Web.PipelineBehaviors.PreProcessors;
+using Web.Services;
+
+//using FastEndpoints.Swagger;
+
+var bld = WebApplication.CreateBuilder(args);
+bld.AddHandlerServer();
+bld.Services
+   .AddCors()
+   .AddOutputCache()
+   .AddIdempotency()
+   .AddFinancialIdempotency(c => c.CallerScope = _ => "anonymous-test-harness")
+   .AddResponseCaching()
+   .AddFastEndpoints(DiscoveredTypes.All)
+   .AddX402()
+   .AddAuthenticationJwtBearer(
+       s => s.SigningKey = bld.Configuration["TokenKey"]!,
+       b => b.Events = new()
+       {
+           OnMessageReceived = ctx =>
+                               {
+                                   //accept tokens from the query string as well (sse/signalr clients)
+                                   var token = ctx.Request.Query["access_token"].FirstOrDefault();
+
+                                   if (!string.IsNullOrEmpty(token))
+                                       ctx.Token = token;
+
+                                   return Task.CompletedTask;
+                               }
+       })
+   .AddAuthorization(o => o.AddPolicy("AdminOnly", b => b.RequireRole(Role.Admin)))
+   .AddKeyedTransient<IKeyedService>("AAA", (_, _) => new MyKeyedService("AAA"))
+   .AddKeyedTransient<IKeyedService>("BBB", (_, _) => new MyKeyedService("BBB"))
+   .AddScoped<IEmailService, EmailService>()
+   .AddSingleton(new SingltonSVC(0))
+   .AddJobQueues<Job, JobStorage>()
+   .RegisterServicesFromWeb()
+   .AddAntiforgery();
+
+bld.Services.AddOpenApiDocuments();
+
+//bld.Services.AddSwaggerDocuments();
+
+if (bld.Environment.EnvironmentName == "Testing")
+    bld.Services.AddSingleton<IX402FacilitatorClient, FakeFacilitatorClient>();
+
+var supportedCultures = new[] { new CultureInfo("en-US") };
+
+var app = bld.Build();
+app.UseRequestLocalization(
+       new RequestLocalizationOptions
+       {
+           DefaultRequestCulture = new("en-US"),
+           SupportedCultures = supportedCultures,
+           SupportedUICultures = supportedCultures
+       })
+   .UseDefaultExceptionHandler()
+   .UseResponseCaching()
+   .UseRouting() //if using, this call must go before auth/cors/fastendpoints middleware
+   .UseCors(b => b.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod())
+   .UseJwtRevocation<JwtBlacklistChecker>()
+   .UseAuthentication()
+   .UseAuthorization()
+   .UseX402(
+       o =>
+       {
+           o.FacilitatorUrl = "https://fake-facilitator.test/";
+           o.Defaults.Network = "eip155:84532";
+           o.Defaults.PayTo = "0xdefault";
+           o.Defaults.Asset = "0xasset";
+           o.Defaults.MimeType = "application/json";
+       })
+   .UseAntiforgeryFE(additionalContentTypes: ["application/json"])
+   .UseOutputCache()
+   .UseFinancialIdempotency()
+   .UseFastEndpoints(
+       c =>
+       {
+           c.Serializer.Options.Converters.Add(new JsonStringEnumConverter());
+
+           c.Validation.EnableDataAnnotationsSupport = true;
+
+           c.Binding.UsePropertyNamingPolicy = true;
+           c.Binding.ReflectionCache.AddFromWeb();
+           c.Binding.ValueParserFor<Guid>(x => new(Guid.TryParse(x, out var res), res));
+
+           c.Endpoints.RoutePrefix = "api";
+           c.Endpoints.ShortNames = false;
+           c.Endpoints.PrefixNameWithFirstTag = true;
+           c.Endpoints.Filter = ep => ep.EndpointTags?.Contains("exclude") is not true;
+           c.Endpoints.Configurator =
+               ep =>
+               {
+                   ep.PreProcessors(Order.Before, typeof(GlobalGenericPreProcessor<>));
+                   ep.PostProcessors(Order.After, typeof(GlobalGenericPostProcessor<,>));
+                   ep.PreProcessor<GlobalStatePreProcessor>(Order.Before);
+                   ep.PreProcessors(Order.Before, new AdminHeaderChecker());
+                   if (ep.EndpointTags?.Contains("Orders") is true)
+                       ep.Description(b => b.Produces<ErrorResponse>(400, "application/problem+json"));
+                   if (ep.EndpointMetadata?.OfType<SomeObject>().Any(s => s.Yes) is true)
+                       ep.AllowAnonymous();
+               };
+
+           c.Versioning.Prefix = "ver";
+
+           c.Throttle.HeaderName = "X-Custom-Throttle-Header";
+           c.Throttle.Message = "Custom Error Response";
+       })
+   .UseEndpoints(
+       c => //this must go after usefastendpoints (only if using endpoints)
+       {
+           c.MapGet("test", () => "hello world!").WithTags("map-get");
+           c.MapGet("test/{testId:int?}", (int? testId) => $"hello {testId}").WithTags("map-get");
+           c.MapGet("non-fe-auth", () => "secure").RequireAuthorization().WithTags("non-fe-auth");
+           c.MapGet("non-fe-auth-anon", () => "anon").RequireAuthorization().AllowAnonymous().WithTags("non-fe-auth");
+           c.MapGet("filtered-shared-path", () => "get").WithTags("exclude");
+           c.MapPost("filtered-shared-path", () => TypedResults.Ok("post")).WithTags("shared-path");
+       });
+
+if (!app.Environment.IsProduction())
+{
+    //app.UseSwaggerGen();
+
+    app.MapOpenApi();
+    app.MapScalarApiReference(
+        o =>
+        {
+            o.AddDocuments("Initial Release", "Release 1.0", "Release 2.0", "Release 3.0");
+            o.OperationTitleSource = OperationTitleSource.Path;
+        });
+}
+app.Services.RegisterGenericCommand(typeof(GenericCommand<>), typeof(GenericCommandHandler<>));
+app.Services.RegisterGenericCommand(typeof(GenericNoResultCommand<>), typeof(GenericNoResultCommandHandler<>));
+app.Services.RegisterGenericCommand<JobTestGenericCommand<SomeEvent>, JobTestGenericCommandHandler<SomeEvent>>();
+app.Services.RegisterGenericStreamCommand(typeof(GenericStreamCommand<>), typeof(GenericStreamCommandHandler<>));
+
+app.MapHandlers(
+    h =>
+    {
+        h.Register<VoidCommand, VoidCommandHandler>();
+        h.Register<SomeCommand, SomeCommandHandler, string>();
+        h.Register<EchoCommand, EchoCommandHandler, EchoCommand>();
+        h.RegisterServerStream<StatusStreamCommand, StatusUpdateHandler, StatusUpdate>();
+        h.RegisterClientStream<CurrentPosition, PositionProgressHandler, ProgressReport>();
+        h.RegisterEventHub<TestEventQueue>();
+        h.RegisterEventHub<MyEvent>();
+    });
+
+app.UseJobQueues(
+    o =>
+    {
+        o.MaxConcurrency = 4;
+        o.LimitsFor<JobTestCommand>(1, TimeSpan.FromSeconds(1));
+        o.LimitsFor<JobCancelTestCommand>(100, TimeSpan.FromSeconds(60));
+        o.StorageProbeDelay = TimeSpan.FromMilliseconds(100);
+    });
+
+var isTestHost = app.Services.CreateScope().ServiceProvider.GetService<IEmailService>() is not EmailService;
+
+if (isTestHost && app.Environment.EnvironmentName != "Testing")
+    throw new InvalidOperationException("TestFixture hasn't set the test environment correctly!");
+
+app.Run();

@@ -1,0 +1,249 @@
+using System.Collections.Frozen;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Diagnostics.CodeAnalysis;
+using System.Text;
+using System.Xml.Linq;
+
+namespace FastEndpoints.OpenApi;
+
+static class XmlDocLookup
+{
+    // cache keyed by assembly instance (not assembly.Location) to avoid clashes between
+    // dynamic/in-memory assemblies that share an empty Location string.
+    // the value is a pre-indexed dictionary of extracted xml member text keyed by member id
+    // (e.g. "P:Namespace.Type.Prop") so per-property lookup is O(1) without retaining the xml DOM.
+    static readonly ConditionalWeakTable<Assembly, FrozenDictionary<string, XmlMemberInfo>> _xmlDocCache = new();
+    static readonly FrozenDictionary<string, XmlMemberInfo> _emptyMembers = FrozenDictionary<string, XmlMemberInfo>.Empty;
+
+    readonly record struct XmlMemberInfo(string? Summary, string? Remarks, string? Example);
+
+    internal static string? GetPropertySummary(PropertyInfo prop)
+        => GetMemberSummary(prop.DeclaringType?.Assembly, PropertyMemberId(prop));
+
+    internal static string? GetPropertyExample(PropertyInfo prop)
+        => GetMemberExample(prop.DeclaringType?.Assembly, PropertyMemberId(prop));
+
+    internal static string? GetTypeSummary(Type type)
+        => GetMemberSummary(type.Assembly, $"T:{GetTypeId(type)}");
+
+    internal static string? GetTypeRemarks(Type type)
+        => GetMemberRemarks(type.Assembly, $"T:{GetTypeId(type)}");
+
+    static string PropertyMemberId(PropertyInfo prop)
+        => $"P:{GetTypeId(prop.DeclaringType)}.{prop.Name}";
+
+    static string? GetMemberSummary(Assembly? assembly, string memberId)
+    {
+        if (assembly is null)
+            return null;
+
+        var members = GetXmlDoc(assembly);
+
+        return members.TryGetValue(memberId, out var member)
+                   ? member.Summary
+                   : null;
+    }
+
+    static string? GetMemberRemarks(Assembly? assembly, string memberId)
+    {
+        if (assembly is null)
+            return null;
+
+        var members = GetXmlDoc(assembly);
+
+        return members.TryGetValue(memberId, out var member)
+                   ? member.Remarks
+                   : null;
+    }
+
+    static string GetTextWithSeeRefs(XElement element)
+    {
+        var sb = new StringBuilder();
+
+        foreach (var node in element.Nodes())
+        {
+            switch (node)
+            {
+                case XText text:
+                    sb.Append(text.Value);
+
+                    break;
+                case XElement { Name.LocalName: "see" } el:
+                {
+                    var cref = el.Attribute("cref")?.Value;
+
+                    if (cref is not null)
+                    {
+                        // extract the short member name from cref (e.g. "P:Namespace.Type.Member" → "Member")
+                        var lastDot = cref.LastIndexOf('.');
+                        sb.Append(lastDot >= 0 ? cref[(lastDot + 1)..] : cref);
+                    }
+
+                    break;
+                }
+                case XElement { Name.LocalName: "paramref" } el:
+                    sb.Append(el.Attribute("name")?.Value);
+
+                    break;
+                case XElement el:
+                    sb.Append(GetTextWithSeeRefs(el));
+
+                    break;
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    static string? GetMemberExample(Assembly? assembly, string memberId)
+    {
+        if (assembly is null)
+            return null;
+
+        var members = GetXmlDoc(assembly);
+
+        return members.TryGetValue(memberId, out var member)
+                   ? member.Example
+                   : null;
+    }
+
+    static string GetTypeId(Type? type)
+    {
+        if (type is null)
+            return string.Empty;
+
+        var fullName = type.FullName ?? type.Name;
+
+        var genericArgsIdx = fullName.IndexOf('[');
+        if (genericArgsIdx >= 0)
+            fullName = fullName[..genericArgsIdx];
+
+        // for nested types: Namespace.Outer+Inner → Namespace.Outer.Inner
+        return fullName.Replace('+', '.');
+    }
+
+    static FrozenDictionary<string, XmlMemberInfo> GetXmlDoc(Assembly assembly)
+        => _xmlDocCache.GetValue(assembly, LoadXmlDoc);
+
+    // a single-file app bundles its assemblies without a location, but publishes their xml files next to the app.
+    [UnconditionalSuppressMessage("SingleFile", "IL3000", Justification = "An empty assembly location falls back to the app base directory.")]
+    static string? GetXmlDocPath(Assembly assembly)
+    {
+        var location = assembly.Location;
+
+        if (!string.IsNullOrEmpty(location))
+            return Path.ChangeExtension(location, ".xml");
+
+        var name = assembly.GetName().Name;
+
+        return name is null ? null : Path.Combine(AppContext.BaseDirectory, $"{name}.xml");
+    }
+
+    static FrozenDictionary<string, XmlMemberInfo> LoadXmlDoc(Assembly assembly)
+    {
+        var xmlPath = GetXmlDocPath(assembly);
+
+        if (xmlPath is null || !File.Exists(xmlPath))
+            return _emptyMembers;
+
+        XDocument doc;
+
+        try
+        {
+            doc = XDocument.Load(xmlPath);
+        }
+        catch
+        {
+            // malformed XML or IO failure: fall back to an empty index rather than crashing the transform
+            return _emptyMembers;
+        }
+
+        var index = new Dictionary<string, XmlMemberInfo>(StringComparer.Ordinal);
+
+        foreach (var member in doc.Descendants("member"))
+        {
+            var name = member.Attribute("name")?.Value;
+
+            if (string.IsNullOrEmpty(name))
+                continue;
+
+            var summary = GetSummary(member);
+            var remarks = GetRemarks(member);
+            var example = GetExample(member);
+
+            if (summary is null && remarks is null && example is null)
+                continue;
+
+            index[name] = new(summary, remarks, example);
+        }
+
+        return index.ToFrozenDictionary(StringComparer.Ordinal);
+
+        static string? GetSummary(XElement member)
+        {
+            var summaryEl = member.Element("summary");
+
+            if (summaryEl is null)
+                return null;
+
+            var summary = RemoveSourceIndentation(GetTextWithSeeRefs(summaryEl));
+
+            return string.IsNullOrWhiteSpace(summary) ? null : summary;
+        }
+
+        static string? GetExample(XElement member)
+        {
+            var example = member.Element("example")?.Value.Trim();
+
+            return string.IsNullOrWhiteSpace(example) ? null : example;
+        }
+
+        static string? GetRemarks(XElement member)
+        {
+            var remarksEl = member.Element("remarks") ?? member.Element("description");
+
+            if (remarksEl is null)
+                return null;
+
+            var remarks = RemoveSourceIndentation(GetTextWithSeeRefs(remarksEl));
+
+            return string.IsNullOrWhiteSpace(remarks) ? null : remarks;
+        }
+    }
+
+    // measure the margin before trimming so the first content line anchors relative indentation.
+    static string RemoveSourceIndentation(string text)
+    {
+        var lines = text.Split('\n');
+        var start = 0;
+        var end = lines.Length - 1;
+
+        while (start <= end && string.IsNullOrWhiteSpace(lines[start]))
+            start++;
+
+        while (end >= start && string.IsNullOrWhiteSpace(lines[end]))
+            end--;
+
+        if (start > end)
+            return string.Empty;
+
+        var indent = int.MaxValue;
+
+        for (var i = start; i <= end; i++)
+        {
+            var line = lines[i];
+
+            if (!string.IsNullOrWhiteSpace(line))
+                indent = Math.Min(indent, line.Length - line.TrimStart().Length);
+        }
+
+        for (var i = start; i <= end; i++)
+        {
+            var line = lines[i];
+            lines[i] = string.IsNullOrWhiteSpace(line) ? string.Empty : line[indent..];
+        }
+
+        return string.Join('\n', lines[start..(end + 1)]);
+    }
+}

@@ -1,0 +1,436 @@
+using System.Collections;
+using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.AspNetCore.OpenApi;
+using Microsoft.OpenApi;
+using static FastEndpoints.OpenApi.OperationReflectionCache;
+using static FastEndpoints.OpenApi.OperationTransformer;
+
+namespace FastEndpoints.OpenApi;
+
+sealed class RequestTransformState
+{
+    public HashSet<string> PropsRemovedFromBody { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, OpenApiParameter> ParametersBySchemaPath { get; } = new(StringComparer.Ordinal);
+    public HashSet<OpenApiParameter> ParametersWithFallbackValues { get; } = new(ReferenceEqualityComparer.Instance);
+
+    internal void RegisterBoundParameter(PropertyInfo property, OpenApiParameter parameter, JsonNamingPolicy? namingPolicy, bool usePropertyNamingPolicy)
+    {
+        // Validator rule paths use serialized property names; wire and CLR aliases can identify unrelated properties.
+        var schemaPath = PropertyNameResolver.GetSchemaPropertyName(property, namingPolicy, usePropertyNamingPolicy);
+        ParametersBySchemaPath[schemaPath] = parameter;
+
+        var metadata = GetPropertyMetadata(property);
+
+        if ((parameter.In == ParameterLocation.Header && metadata.FromHeader is { IsRequired: false }) ||
+            (parameter.In == ParameterLocation.Query &&
+             (metadata.FromClaim is { IsRequired: false } || metadata.HasPermission is { IsRequired: false })))
+        {
+            ParametersWithFallbackValues.Add(parameter);
+
+            // Query schema nullability describes the final value, which claims can also supply.
+            if (parameter.In == ParameterLocation.Query && metadata.DontBind?.IsRequired is not true)
+                parameter.Required = false;
+        }
+    }
+}
+
+sealed record PromotedBodyProperty(string Name, Type Type);
+
+sealed partial class RequestOperationTransformer(DocumentOptions docOpts, SharedContext sharedCtx)
+{
+    readonly OperationParameterFactory _parameterFactory = new(docOpts, sharedCtx);
+    readonly OperationParameterNameResolver _parameterNameResolver = new(docOpts, sharedCtx);
+    readonly RequestBodyOverrideApplicator _requestBodyOverrideApplicator = new(docOpts, sharedCtx);
+    readonly RequestParameterMetadataApplicator _requestParameterMetadataApplicator = new(docOpts, sharedCtx);
+    readonly ComplexQueryParameterExpander _complexQueryParameterExpander = new(new(docOpts, sharedCtx), new(docOpts, sharedCtx));
+    readonly RouteParameterApplicator _routeParameterApplicator = new(docOpts, sharedCtx);
+
+    static readonly HashSet<string> _illegalHeaderNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Accept",
+        "Content-Type",
+        "Authorization"
+    };
+
+    JsonNamingPolicy? NamingPolicy => sharedCtx.NamingPolicy;
+    JsonSerializerOptions SerializerOptions => sharedCtx.SerializerOptions ?? Cfg.SerOpts.Options;
+
+    public RequestTransformState HandleParameters(OpenApiOperation operation,
+                                                  OpenApiOperationTransformerContext context,
+                                                  EndpointDefinition epDef,
+                                                  string documentPath,
+                                                  string operationKey,
+                                                  OpenApiGenerationState generation)
+    {
+        var state = new RequestTransformState();
+        var endpointRouteTemplate = FindEndpointRouteTemplate(epDef, documentPath);
+        var routeParameters = GetRouteParameters(endpointRouteTemplate ?? context.Description.RelativePath ?? documentPath);
+        var routeParameterLookup = RouteParameterApplicator.BuildLookup(routeParameters);
+
+        var requestDtoType = epDef.ReqDtoType;
+
+        if (requestDtoType != Types.EmptyRequest)
+        {
+            var isBodylessRequest = context.Description.HttpMethod is "GET" or "HEAD";
+            var useQueryParamsForBodylessRequest = context.Description.HttpMethod is "HEAD" ||
+                                                   (context.Description.HttpMethod is "GET" && !docOpts.EnableGetRequestsWithBody);
+            var requestDtoIsList = requestDtoType.IsCollection();
+            var requestDtoProps = requestDtoIsList
+                                      ? null
+                                      : GetPublicInstanceProperties(requestDtoType).ToList();
+
+            ValidateRequestDto(epDef, requestDtoType, requestDtoIsList);
+
+            if (requestDtoProps is not null)
+            {
+                RemoveHiddenProperties(operation, requestDtoProps, state, operationKey, generation);
+                AddBoundParameters(operation, requestDtoProps, routeParameterLookup, useQueryParamsForBodylessRequest, state, operationKey, generation);
+            }
+
+            // remove request body if GET (unless explicitly enabled), HEAD, or empty
+            if (useQueryParamsForBodylessRequest || operation.IsRequestBodyEmpty(generation))
+            {
+                if (!requestDtoIsList)
+                    operation.RequestBody = null;
+            }
+
+            if (isBodylessRequest && IsSupportedOptionalRootCollection(requestDtoType) && operation.RequestBody is OpenApiRequestBody requestBody)
+                requestBody.Required = false;
+        }
+
+        _routeParameterApplicator.EnsureRouteParameters(operation, routeParameters, generation);
+
+        return state;
+    }
+
+    public PromotedBodyProperty? ApplyBodyOverrides(OpenApiOperation operation, EndpointDefinition epDef, string operationKey, OpenApiGenerationState generation)
+        => _requestBodyOverrideApplicator.Apply(operation, epDef, operationKey, generation);
+
+    public void ApplyParameterMetadata(OpenApiOperation operation, EndpointDefinition epDef)
+        => _requestParameterMetadataApplicator.Apply(operation, epDef);
+
+    public void ApplyExamples(OpenApiOperation operation,
+                              EndpointDefinition epDef,
+                              RequestTransformState state,
+                              PromotedBodyProperty? promotedBodyProperty,
+                              OpenApiGenerationState generation)
+    {
+        if (epDef.EndpointSummary?.RequestExamples.Count is not > 0)
+            return;
+
+        if (operation.RequestBody?.Content is null)
+            return;
+
+        var examples = BuildUniqueRequestExamples(epDef.EndpointSummary.RequestExamples);
+        var fallbackExample = BuildRequestExampleFallback(epDef, state.PropsRemovedFromBody, promotedBodyProperty);
+        var exampleNodes = new List<(RequestExample Example, JsonNode? Node)>(examples.Count);
+
+        foreach (var example in examples)
+            exampleNodes.Add((example, BuildRequestExampleNode(example.Value, state.PropsRemovedFromBody, promotedBodyProperty)));
+
+        foreach (var content in operation.RequestBody.Content.GetMutableMediaTypes())
+        {
+            var schema = content.Schema.ResolveSchema(generation);
+
+            if (exampleNodes.Count == 1)
+            {
+                content.Example = NormalizeExampleNode(
+                    exampleNodes[0].Node?.DeepClone(),
+                    schema,
+                    fallbackExample,
+                    generation);
+                content.Examples?.Clear();
+            }
+            else
+            {
+                content.Example = null;
+                content.Examples ??= new Dictionary<string, IOpenApiExample>();
+
+                foreach (var (example, exampleNode) in exampleNodes)
+                {
+                    content.Examples[example.Label] = new OpenApiExample
+                    {
+                        Summary = example.Summary,
+                        Description = example.Description,
+                        Value = NormalizeExampleNode(
+                            exampleNode?.DeepClone(),
+                            schema,
+                            fallbackExample,
+                            generation)
+                    };
+                }
+            }
+        }
+    }
+
+    public void ApplyBodySchemaMetadata(OpenApiOperation operation,
+                                        EndpointDefinition epDef,
+                                        PromotedBodyProperty? promotedBodyProperty,
+                                        string operationKey,
+                                        OpenApiGenerationState generation)
+    {
+        if (operation.RequestBody?.Content is null)
+            return;
+
+        var paramDescriptions = epDef.EndpointSummary?.Params;
+        var hasParams = paramDescriptions is { Count: > 0 };
+        var paramDescriptionLookup = hasParams ? paramDescriptions!.ToCaseInsensitiveDictionary(paramDescriptions!.Count) : null;
+        var defaultProps = BuildRequestSchemaDefaultLookup(promotedBodyProperty?.Type ?? epDef.ReqDtoType);
+
+        if (!hasParams && defaultProps.Count == 0)
+            return;
+
+        var mutationCtx = new OperationSchemaMutationContext(sharedCtx, generation, operationKey);
+
+        foreach (var content in operation.RequestBody.Content.GetMutableMediaTypes())
+        {
+            var schema = content.Schema.ResolveSchema(generation);
+
+            if (schema?.Properties is null)
+                continue;
+
+            OpenApiSchema? localSchema = null;
+
+            foreach (var (propName, propSchema) in schema.Properties)
+            {
+                var resolvedProp = propSchema.ResolveSchema(generation);
+
+                if (resolvedProp is null)
+                    continue;
+
+                string? description = null;
+                var needsDescription = paramDescriptionLookup?.TryGetValue(propName, out description) == true &&
+                                       (propSchema.Description ?? resolvedProp.Description) != description;
+                var needsDefault = defaultProps.TryGetValue(propName, out var defaultAttr) && resolvedProp.Default is null;
+
+                if (!needsDescription && !needsDefault)
+                    continue;
+
+                localSchema ??= content.EnsureOperationLocalSchemaForMutation(mutationCtx, "requestBody");
+
+                var concreteProp = localSchema?.Properties?[propName].EnsureSchemaForMutation(
+                    mutationCtx,
+                    $"requestBody.{propName}",
+                    localized => localSchema.Properties[propName] = localized);
+
+                if (concreteProp is null)
+                    continue;
+
+                if (needsDescription)
+                {
+                    concreteProp.Description = description;
+
+                    // the replacement reference keeps the xml summary next to its $ref, which would hide the override.
+                    if (localSchema!.Properties?[propName] is OpenApiSchemaReference localizedRef)
+                        localizedRef.Description = description;
+                }
+
+                if (needsDefault && concreteProp.Default is null)
+                    concreteProp.Default = defaultAttr.ToJsonNode(SerializerOptions);
+            }
+        }
+    }
+
+    Dictionary<string, System.ComponentModel.DefaultValueAttribute> BuildRequestSchemaDefaultLookup(Type? requestType)
+    {
+        if (requestType is null)
+            return [];
+
+        var defaults = new Dictionary<string, System.ComponentModel.DefaultValueAttribute>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var prop in GetPublicInstanceProperties(requestType))
+        {
+            var defaultAttr = GetPropertyMetadata(prop).DefaultValue;
+
+            if (defaultAttr?.Value is null)
+                continue;
+
+            var schemaName = PropertyNameResolver.GetSchemaPropertyName(prop, NamingPolicy, docOpts.UsePropertyNamingPolicy);
+            defaults[schemaName] = defaultAttr;
+        }
+
+        return defaults;
+    }
+
+    void RemoveHiddenProperties(OpenApiOperation operation, List<PropertyInfo> requestDtoProps, RequestTransformState state, string operationKey, OpenApiGenerationState generation)
+    {
+        for (var i = requestDtoProps.Count - 1; i >= 0; i--)
+        {
+            var p = requestDtoProps[i];
+
+            var metadata = GetPropertyMetadata(p);
+
+            if (!metadata.IsJsonIgnoredAlways &&
+                !metadata.IsHiddenFromDocs &&
+                metadata.HasPublicSetter)
+                continue;
+
+            requestDtoProps.RemoveAt(i);
+            operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+        }
+    }
+
+    void AddBoundParameters(OpenApiOperation operation,
+                            List<PropertyInfo> requestDtoProps,
+                            Dictionary<string, RouteParameterInfo> routeParameters,
+                            bool useQueryParamsForBodylessRequest,
+                            RequestTransformState state,
+                            string operationKey,
+                            OpenApiGenerationState generation)
+    {
+        for (var i = 0; i < requestDtoProps.Count; i++)
+        {
+            var p = requestDtoProps[i];
+            var metadata = GetPropertyMetadata(p);
+
+            AddAttributeParameters(operation, p, metadata, state, operationKey, generation);
+            var boundToRoute = _routeParameterApplicator.AddBoundRouteParameter(operation, p, routeParameters, state, operationKey, generation);
+
+            var queryParamName = _parameterNameResolver.GetQueryName(p);
+
+            if (ShouldAddQueryParam(p, metadata, operation, queryParamName, useQueryParamsForBodylessRequest) &&
+                (!boundToRoute || IsSupplementaryQuerySource(metadata)))
+            {
+                operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+
+                if (_complexQueryParameterExpander.TryAdd(operation, p, docOpts.ShortSchemaNames, generation))
+                    continue;
+
+                state.RegisterBoundParameter(
+                    p,
+                    AddParameter(
+                        operation,
+                        queryParamName,
+                        ParameterLocation.Query,
+                        p,
+                        generation,
+                        GetDontBindRequiredness(p),
+                        docOpts.ShortSchemaNames),
+                    NamingPolicy,
+                    docOpts.UsePropertyNamingPolicy);
+
+                continue;
+            }
+
+            if (!IsQueryBoundProperty(p, metadata, useQueryParamsForBodylessRequest) ||
+                OperationParameterCollection.Find(operation, ParameterLocation.Query, queryParamName) is not { } existingQuery)
+                continue;
+
+            var schemaPath = PropertyNameResolver.GetSchemaPropertyName(p, NamingPolicy, docOpts.UsePropertyNamingPolicy);
+
+            if (!state.ParametersBySchemaPath.ContainsKey(schemaPath))
+                state.RegisterBoundParameter(p, existingQuery, NamingPolicy, docOpts.UsePropertyNamingPolicy);
+        }
+    }
+
+    static bool? GetDontBindRequiredness(PropertyInfo property)
+        => property.GetCustomAttribute<DontBindAttribute>()?.IsRequired is true ? true : null;
+
+    void AddAttributeParameters(OpenApiOperation operation,
+                                PropertyInfo p,
+                                PropertyMetadata metadata,
+                                RequestTransformState state,
+                                string operationKey,
+                                OpenApiGenerationState generation)
+    {
+        if (metadata.FromHeader is { } hAttrib)
+        {
+            var pName = hAttrib.HeaderName ?? _parameterNameResolver.ApplyPropertyNamingPolicy(p.Name);
+
+            if (IsIllegalHeaderName(pName))
+            {
+                operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+
+                return;
+            }
+
+            var headerParam = OperationParameterCollection.Find(operation, ParameterLocation.Header, pName) ??
+                              AddParameter(operation, pName, ParameterLocation.Header, p, generation, hAttrib.IsRequired, docOpts.ShortSchemaNames);
+            state.RegisterBoundParameter(p, headerParam, NamingPolicy, docOpts.UsePropertyNamingPolicy);
+
+            if (hAttrib.IsRequired || hAttrib.RemoveFromSchema)
+                operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+        }
+
+        if (metadata.FromCookie is { } cAttrib)
+        {
+            var pName = cAttrib.CookieName ?? _parameterNameResolver.ApplyPropertyNamingPolicy(p.Name);
+            var cookieParam = OperationParameterCollection.Find(operation, ParameterLocation.Cookie, pName) ??
+                              AddParameter(operation, pName, ParameterLocation.Cookie, p, generation, cAttrib.IsRequired, docOpts.ShortSchemaNames);
+            state.RegisterBoundParameter(p, cookieParam, NamingPolicy, docOpts.UsePropertyNamingPolicy);
+
+            if (cAttrib.IsRequired || cAttrib.RemoveFromSchema)
+                operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+        }
+
+        if (metadata.FromClaim is { IsRequired: true } or { RemoveFromSchema: true } ||
+            metadata.HasPermission is { IsRequired: true } or { RemoveFromSchema: true })
+            operation.RemovePropFromRequestBody(p, sharedCtx, generation, operationKey, docOpts, NamingPolicy, state.PropsRemovedFromBody);
+    }
+
+    OpenApiParameter AddParameter(OpenApiOperation operation,
+                                  string name,
+                                  ParameterLocation location,
+                                  PropertyInfo? prop,
+                                  OpenApiGenerationState generation,
+                                  bool? isRequired = null,
+                                  bool shortSchemaNames = false,
+                                  Type? explicitType = null)
+    {
+        var param = _parameterFactory.Create(name, location, prop, generation, isRequired, shortSchemaNames, explicitType);
+        OperationParameterCollection.Add(operation, param);
+
+        return param;
+    }
+
+    static bool IsIllegalHeaderName(string name)
+        => _illegalHeaderNames.Contains(name);
+
+    static void ValidateRequestDto(EndpointDefinition epDef, Type requestDtoType, bool requestDtoIsList)
+    {
+        if (requestDtoType == Types.EmptyRequest || requestDtoIsList || GlobalConfig.AllowEmptyRequestDtos)
+            return;
+
+        if (GetBindableRequestProperties(requestDtoType).Any())
+            return;
+
+        throw new NotSupportedException(
+            "Request DTOs without any publicly accessible properties are not supported. " +
+            $"Offending Endpoint: [{epDef.EndpointType.FullName}] " +
+            $"Offending DTO type: [{requestDtoType.FullName}]");
+    }
+
+    static bool IsSupportedOptionalRootCollection(Type requestDtoType)
+        => requestDtoType.IsArray ||
+           (requestDtoType.IsGenericType && requestDtoType.GetGenericTypeDefinition() == Types.ListOf1);
+
+    static bool ShouldAddQueryParam(PropertyInfo prop,
+                                    PropertyMetadata metadata,
+                                    OpenApiOperation operation,
+                                    string queryParamName,
+                                    bool isBodylessRequest)
+        => IsQueryBoundProperty(prop, metadata, isBodylessRequest) &&
+           !OperationParameterCollection.Has(operation, ParameterLocation.Query, queryParamName);
+
+    static bool IsQueryBoundProperty(PropertyInfo prop, PropertyMetadata metadata, bool isBodylessRequest)
+    {
+        if (metadata.FromHeader is not null || metadata.FromCookie is not null)
+            return false;
+
+        if (metadata.FromClaim is { } fromClaim)
+            return fromClaim is { IsRequired: false, RemoveFromSchema: false };
+
+        if (metadata.HasPermission is { } hasPermission)
+            return hasPermission is { IsRequired: false, RemoveFromSchema: false };
+
+        if (metadata.DontBind?.BindingSources.HasFlag(Source.QueryParam) == true)
+            return false;
+
+        return isBodylessRequest || prop.IsDefined(Types.QueryParamAttribute);
+    }
+
+    static bool IsSupplementaryQuerySource(PropertyMetadata metadata)
+        => metadata.FromClaim is { IsRequired: false } || metadata.HasPermission is { IsRequired: false };
+}

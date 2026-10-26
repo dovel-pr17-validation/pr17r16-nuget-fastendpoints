@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <InterceptorsNamespaces>$(InterceptorsNamespaces);Microsoft.AspNetCore.OpenApi.Generated</InterceptorsNamespaces>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\Src\OpenApi\FastEndpoints.OpenApi.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Testing\FastEndpoints.Testing.csproj"/>
+        <ProjectReference Include="..\..\..\TestHarness\Web\Web.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Include="Snapshots/**/*.json;Snapshots/**/*.http" CopyToOutputDirectory="Always"/>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="Always"/>
+    </ItemGroup>
+
+</Project>

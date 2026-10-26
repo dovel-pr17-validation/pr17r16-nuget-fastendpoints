@@ -1,0 +1,49 @@
+---
+type: Reference
+title: Project Overview
+description: FastEndpoints is a REPR-pattern ASP.NET library monorepo published as multiple NuGet packages.
+tags: [overview]
+resource: README.md
+---
+
+# Project Overview
+
+## Purpose
+**FastEndpoints** is a developer-oriented alternative to Minimal APIs and MVC for ASP.NET Core. It implements the **REPR** pattern (Request-Endpoint-Response) with low boilerplate. Public docs: https://fast-endpoints.com
+
+## Scope
+Library monorepo, not a hosted product. Package inventory: [monorepo-packages.md](monorepo-packages.md).
+
+## Consumers
+- App developers targeting ASP.NET Core **net10.0 / net11.0**
+- NuGet consumers
+
+## Capabilities
+- Endpoint discovery (reflection or source-generated `DiscoveredTypes`)
+- FluentValidation, pre/post processors, mappers
+- In-process command/event bus and gRPC remote messaging
+- Job queues (storage SPI) and HTTP request idempotency (`AddIdempotency` fingerprint; `AddFinancialIdempotency` reservation)
+- JWT/cookie auth, feature flags (`IFeatureFlag`), X402 payment helpers
+- OpenAPI (Microsoft.AspNetCore.OpenApi), AOT-oriented generation
+
+## Status
+- Core version: `Src/Directory.Build.props` `<Version>` (never cite OKF)
+- Agents versions: per-csproj under `Src/Agents/`
+- Solutions: `FastEndpoints.slnx` (primary), `NativeAot.slnx` (AOT)
+
+## Non-goals
+- Roadmap, sponsorship, and API catalog live in the docs site / changelog
+- Public doc pages: sibling `../FE-Docs/` ([workflows.md](workflows.md))
+
+## Glossary
+| Term | Meaning |
+| --- | --- |
+| REPR | Request-Endpoint-Response |
+| SUT / harness | Sample apps under `TestHarness/` used by integration tests |
+| WAF | `WebApplicationFactory` via `FastEndpoints.Testing.AppFixture` |
+| DiscoveredTypes | Source-generated type list for AOT-friendly registration |
+
+## Sources
+- `README.md`
+- `Src/Directory.Build.props`
+- `FastEndpoints.slnx`

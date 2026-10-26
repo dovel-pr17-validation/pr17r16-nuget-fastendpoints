@@ -1,0 +1,81 @@
+using FastEndpoints.Messaging.Remote.Core;
+using Grpc.Core;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace FastEndpoints;
+
+/// <summary>
+/// client extension methods
+/// </summary>
+public static class RemoteConnectionExtensions
+{
+    /// <summary>
+    /// creates a grpc channel/connection to a remote server that hosts a known collection of command handlers and event hubs.
+    /// <para>
+    /// IMPORTANT: call the <see cref="RemoteConnectionCore.Register{TCommand,TResult}" /> method (using action <paramref name="r" />) to specify which commands are
+    /// handled by this remote server. event subscriptions can be specified using <c>app.Subscribe&lt;TEvent, TEventHandler&gt;()</c> method.
+    /// </para>
+    /// </summary>
+    /// <param name="host"></param>
+    /// <param name="remoteAddress">the address of the remote server</param>
+    /// <param name="r">a configuration action for the connection</param>
+    public static IHost MapRemote(this IHost host, string remoteAddress, Action<RemoteConnection> r)
+    {
+        r(new(remoteAddress, host.Services));
+
+        var logger = host.Services.GetRequiredService<ILogger<RemoteConnection>>();
+        logger.RemoteConnectionConfigured(remoteAddress, RemoteConnectionCore.RemoteMap.Count);
+
+        return host;
+    }
+
+    /// <summary>
+    /// register a custom event subscriber storage provider
+    /// </summary>
+    /// <param name="services"></param>
+    /// <typeparam name="TStorageRecord">the type of the storage record</typeparam>
+    /// <typeparam name="TStorageProvider"></typeparam>
+    /// <param name="expiry">optional duration after which an event record expires. defaults to 4 hours if not specified.</param>
+    public static IServiceCollection AddEventSubscriberStorageProvider<TStorageRecord, TStorageProvider>(this IServiceCollection services, TimeSpan? expiry = null)
+        where TStorageRecord : IEventStorageRecord, new()
+        where TStorageProvider : class, IEventSubscriberStorageProvider<TStorageRecord>
+    {
+        RemoteConnectionCore.StorageProviderType = typeof(TStorageProvider);
+        RemoteConnectionCore.StorageRecordType = typeof(TStorageRecord);
+        if (expiry.HasValue)
+            RemoteConnectionCore.EventRecordExpiry = expiry.Value;
+
+        services.AddSingleton<TStorageProvider>();
+
+        return services;
+    }
+
+    /// <param name="evnt"></param>
+    extension(IEvent evnt)
+    {
+        /// <summary>
+        /// publish the event to the relevant remote server that's running in <see cref="HubMode.EventBroker" /> mode.
+        /// </summary>
+        /// <param name="ct">cancellation token</param>
+        /// <exception cref="InvalidOperationException">thrown if the relevant remote handler has not been registered</exception>
+        public Task RemotePublishAsync(CancellationToken ct)
+            => evnt.RemotePublishAsync(new CallOptions(cancellationToken: ct));
+
+        /// <summary>
+        /// publish the event to the relevant remote server that's running in <see cref="HubMode.EventBroker" /> mode.
+        /// </summary>
+        /// <param name="options">call options</param>
+        /// <exception cref="InvalidOperationException">thrown if the relevant remote handler has not been registered</exception>
+        public Task RemotePublishAsync(CallOptions options = default)
+        {
+            var tEvent = evnt.GetType();
+
+            return
+                RemoteConnectionCore.RemoteMap.TryGetValue(tEvent, out var remote)
+                    ? ((RemoteConnection)remote).PublishEvent(evnt, tEvent, options)
+                    : throw new InvalidOperationException($"No remote broker has been mapped for the event: [{tEvent.FullName}]");
+        }
+    }
+}

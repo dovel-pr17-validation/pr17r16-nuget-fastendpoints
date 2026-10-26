@@ -1,0 +1,379 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
+using System.Text.Json.Nodes;
+using Microsoft.OpenApi;
+
+namespace FastEndpoints.OpenApi;
+
+static partial class OperationSchemaHelpers
+{
+    static readonly ConstructorInfo? _openApiSchemaCopyCtor = typeof(OpenApiSchema).GetConstructor([typeof(IOpenApiSchema)]);
+    static readonly PropertyInfo[] _openApiSchemaProperties = typeof(OpenApiSchema).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+    static readonly ConcurrentDictionary<Type, PropertyInfo[]> _cloneablePropertiesCache = new();
+
+    extension(IOpenApiSchema? schema)
+    {
+        internal OpenApiSchema? ResolveSchema()
+            => schema.ResolveSchema(components: null);
+
+        /// <summary>
+        /// Resolve a schema, optionally falling back to <paramref name="components"/> when
+        /// <c>HostDocument</c> is unset on the reference (e.g. post-generation export walks).
+        /// </summary>
+        internal OpenApiSchema? ResolveSchema(IDictionary<string, IOpenApiSchema>? components)
+        {
+            // Target / HostDocument first (same as parameterless historically).
+            var resolved = schema switch
+            {
+                OpenApiSchemaReference schemaRef => ResolveSchemaReference(schemaRef) as OpenApiSchema,
+                OpenApiSchema concreteSchema => concreteSchema,
+                _ => null
+            };
+
+            if (resolved is not null)
+                return resolved;
+
+            // HostDocument can be unset after document generation; fall back to supplied components.
+            if (schema is OpenApiSchemaReference unresolvedRef &&
+                components is not null &&
+                unresolvedRef.GetReferenceId() is { Length: > 0 } refId &&
+                components.TryGetValue(refId, out var componentSchema))
+            {
+                return componentSchema as OpenApiSchema ?? componentSchema.ResolveSchema();
+            }
+
+            return null;
+        }
+
+        internal OpenApiSchema? ResolveSchema(OpenApiGenerationState generation)
+            => schema switch
+            {
+                OpenApiSchemaReference schemaRef when schemaRef.GetReferenceId() is { } refId && generation.TryGetOperationSchemaVariant(refId, out var variant) => variant,
+                _ => schema.ResolveSchema()
+            };
+
+        internal OpenApiSchema? ResolveSchema(SharedContext sharedCtx, OpenApiDocument document)
+            => schema.ResolveSchema(sharedCtx.For(document));
+
+        internal IOpenApiSchema? ResolveSchemaOrReference()
+            => schema switch
+            {
+                OpenApiSchemaReference schemaRef => ResolveSchemaReference(schemaRef),
+                OpenApiSchema concreteSchema => concreteSchema,
+                _ => null
+            };
+
+        internal IOpenApiSchema? ResolveSchemaOrReference(OpenApiGenerationState generation)
+            => schema switch
+            {
+                OpenApiSchemaReference schemaRef when schemaRef.GetReferenceId() is { } refId && generation.TryGetOperationSchemaVariant(refId, out var variant) => variant,
+                _ => schema.ResolveSchemaOrReference()
+            };
+
+        internal OpenApiSchema? CloneAsConcreteSchema()
+            => schema switch
+            {
+                OpenApiSchema concreteSchema => CloneConcreteSchema(concreteSchema),
+                OpenApiSchemaReference schemaRef when ResolveSchemaReference(schemaRef) is { } target => CloneConcreteSchema(target),
+                _ => null
+            };
+    }
+
+    extension(OpenApiMediaType mediaType)
+    {
+        internal OpenApiSchema? EnsureOperationLocalSchema()
+        {
+            var cloned = mediaType.Schema.CloneAsConcreteSchema();
+
+            if (cloned is not null)
+                mediaType.Schema = cloned;
+
+            return cloned;
+        }
+
+        internal OpenApiSchema? EnsureOperationLocalSchemaForMutation()
+            => mediaType.EnsureOperationLocalSchema();
+
+        internal OpenApiSchema? EnsureOperationLocalSchemaForMutation(SharedContext sharedCtx, OpenApiGenerationState generation, string operationKey, string schemaKey)
+            => mediaType.Schema.EnsureSchemaForMutation(
+                sharedCtx,
+                generation,
+                operationKey,
+                schemaKey,
+                localized => mediaType.Schema = localized,
+                cloneConcreteSchema: true);
+
+        internal OpenApiSchema? EnsureOperationLocalSchemaForMutation(OperationSchemaMutationContext mutationCtx, string schemaKey)
+            => mediaType.Schema.EnsureSchemaForMutation(
+                mutationCtx,
+                schemaKey,
+                localized => mediaType.Schema = localized,
+                cloneConcreteSchema: true);
+    }
+
+    extension(IOpenApiSchema? schema)
+    {
+        internal OpenApiSchema? EnsureSchemaForMutation(OperationSchemaMutationContext mutationCtx,
+                                                        string schemaKey,
+                                                        Action<IOpenApiSchema> replace,
+                                                        bool cloneConcreteSchema = false)
+            => schema.EnsureSchemaForMutation(
+                mutationCtx.SharedContext,
+                mutationCtx.Generation,
+                mutationCtx.OperationKey,
+                schemaKey,
+                replace,
+                cloneConcreteSchema);
+
+        internal OpenApiSchema? EnsureSchemaForMutation(SharedContext sharedCtx,
+                                                        OpenApiGenerationState generation,
+                                                        string operationKey,
+                                                        string schemaKey,
+                                                        Action<IOpenApiSchema> replace,
+                                                        bool cloneConcreteSchema = false)
+        {
+            switch (schema)
+            {
+                case OpenApiSchemaReference schemaRef when schemaRef.GetReferenceId() is { } refId:
+                {
+                    if (generation.TryGetOperationSchemaVariant(refId, out var existingVariant))
+                        return existingVariant;
+
+                    var cloned = schemaRef.CloneAsConcreteSchema();
+
+                    if (cloned is null)
+                        return null;
+
+                    var variant = generation.GetOrAddOperationSchemaVariant(refId, operationKey, schemaKey, cloned);
+                    replace(schemaRef.RetargetTo(variant.RefId));
+
+                    return variant.Schema;
+                }
+                case OpenApiSchema concreteSchema when cloneConcreteSchema:
+                {
+                    var cloned = CloneConcreteSchema(concreteSchema);
+                    replace(cloned);
+
+                    return cloned;
+                }
+                case OpenApiSchema concreteSchema:
+                    return concreteSchema;
+                default:
+                    return null;
+            }
+        }
+    }
+
+    static OpenApiSchema CloneConcreteSchema(IOpenApiSchema schema)
+    {
+        if (_openApiSchemaCopyCtor?.Invoke([schema]) is OpenApiSchema cloned)
+            return cloned;
+
+        return CloneConcreteSchemaFallback(schema.ResolveSchema() ?? schema as OpenApiSchema ?? StringSchema());
+    }
+
+    static OpenApiSchema CloneConcreteSchemaFallback(OpenApiSchema schema)
+    {
+        var clone = new OpenApiSchema();
+
+        foreach (var property in _openApiSchemaProperties)
+        {
+            if (!property.CanRead || !property.CanWrite)
+                continue;
+
+            //assigning a null is not the same as leaving the member alone: OpenApiSchema.Const tracks
+            //assignment, so setting it to null makes the writer emit "const": null on the clone.
+            if (property.GetValue(schema) is not { } value)
+                continue;
+
+            property.SetValue(clone, CloneSchemaMemberValue(property.Name, value));
+        }
+
+        return clone;
+    }
+
+    static object? CloneSchemaMemberValue(string memberName, object? value)
+    {
+        if (value is null)
+            return null;
+
+        return value switch
+        {
+            JsonNode node => node.DeepClone(),
+            OpenApiSchema concreteSchema => CloneConcreteSchemaFallback(concreteSchema),
+            OpenApiSchemaReference schemaRef => schemaRef,
+            IOpenApiSchema schema => CloneNestedSchema(schema),
+            IDictionary<string, IOpenApiSchema> schemaDictionary => CloneSchemaDictionary(schemaDictionary),
+            IDictionary<string, OpenApiSchemaReference> mappingDictionary => new Dictionary<string, OpenApiSchemaReference>(mappingDictionary, StringComparer.Ordinal),
+            IDictionary<string, string> stringDictionary => new Dictionary<string, string>(stringDictionary, StringComparer.Ordinal),
+            IDictionary<string, bool> boolDictionary => new Dictionary<string, bool>(boolDictionary, StringComparer.Ordinal),
+            IDictionary<string, JsonNode> jsonNodeDictionary => CloneJsonNodeDictionary(jsonNodeDictionary),
+            IDictionary<string, HashSet<string>> stringSetDictionary => CloneStringSetDictionary(stringSetDictionary),
+            IDictionary<string, IOpenApiExtension> extensionsDictionary => CloneExtensionsDictionary(extensionsDictionary),
+            IDictionary<string, object> metadataDictionary => CloneMetadataDictionary(memberName, metadataDictionary),
+            IList<IOpenApiSchema> schemaList => CloneSchemaList(schemaList),
+            ISet<string> requiredSet => new HashSet<string>(requiredSet),
+            IList<JsonNode> jsonNodes => CloneJsonNodeList(jsonNodes),
+            OpenApiDiscriminator discriminator => CloneOpenApiObject(discriminator),
+            OpenApiExternalDocs externalDocs => CloneOpenApiObject(externalDocs),
+            OpenApiXml xml => CloneOpenApiObject(xml),
+            _ when IsSafelyShareable(value) => value,
+            _ => throw new NotSupportedException(
+                     $"OpenApiSchema member '{memberName}' has unsupported mutable type '{value.GetType().FullName}' for cloning. " +
+                     "Update the schema clone logic before using operation-local schema mutations.")
+        };
+    }
+
+    static T CloneOpenApiObject<T>(T source) where T : new()
+    {
+        var clone = new T();
+
+        foreach (var property in GetCloneableProperties(typeof(T)))
+            property.SetValue(clone, CloneSchemaMemberValue(property.Name, property.GetValue(source)));
+
+        return clone;
+    }
+
+    [UnconditionalSuppressMessage("aot", "IL2070")]
+    static PropertyInfo[] GetCloneableProperties(Type type)
+        => _cloneablePropertiesCache.GetOrAdd(
+            type,
+            static t => t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                         .Where(p => p is { CanRead: true, CanWrite: true } && p.GetIndexParameters().Length == 0)
+                         .ToArray());
+
+    static Dictionary<string, JsonNode>? CloneJsonNodeDictionary(IDictionary<string, JsonNode>? nodes)
+        => CloneDictionary(nodes, static node => node.DeepClone());
+
+    static Dictionary<string, HashSet<string>>? CloneStringSetDictionary(IDictionary<string, HashSet<string>>? sets)
+        => CloneDictionary(sets, static set => new HashSet<string>(set, StringComparer.Ordinal));
+
+    static Dictionary<string, IOpenApiExtension>? CloneExtensionsDictionary(IDictionary<string, IOpenApiExtension>? extensions)
+        => CloneDictionary(
+            extensions,
+            static IOpenApiExtension (extension) => extension switch
+            {
+                JsonNodeExtension { Node: var node } => new JsonNodeExtension(node.DeepClone()),
+                _ => throw new NotSupportedException(
+                         $"OpenApiSchema extension type '{extension.GetType().FullName}' is not supported for cloning. " +
+                         "Update the schema clone logic before using operation-local schema mutations with this extension type.")
+            });
+
+    static Dictionary<string, object>? CloneMetadataDictionary(string memberName, IDictionary<string, object>? metadata)
+        => CloneDictionary(metadata, value => CloneSchemaMemberValue(memberName, value) ?? new object());
+
+    static Dictionary<string, IOpenApiSchema>? CloneSchemaDictionary(IDictionary<string, IOpenApiSchema>? schemas)
+        => CloneDictionary(schemas, static schema => CloneNestedSchema(schema)!);
+
+    static Dictionary<string, TValue>? CloneDictionary<TSource, TValue>(IDictionary<string, TSource>? source, Func<TSource, TValue> cloneValue)
+    {
+        if (source is null)
+            return null;
+
+        var cloned = new Dictionary<string, TValue>(source.Count, StringComparer.Ordinal);
+
+        foreach (var (key, value) in source)
+            cloned[key] = cloneValue(value);
+
+        return cloned;
+    }
+
+    static List<IOpenApiSchema>? CloneSchemaList(IList<IOpenApiSchema>? schemas)
+    {
+        if (schemas is null)
+            return null;
+
+        var cloned = new List<IOpenApiSchema>(schemas.Count);
+
+        foreach (var schema in schemas)
+            cloned.Add(CloneNestedSchema(schema)!);
+
+        return cloned;
+    }
+
+    static IOpenApiSchema? CloneNestedSchema(IOpenApiSchema? schema)
+        => schema switch
+        {
+            OpenApiSchema concreteSchema => CloneConcreteSchemaFallback(concreteSchema),
+            OpenApiSchemaReference schemaRef => schemaRef,
+            null => null,
+            _ => schema
+        };
+
+    static IOpenApiSchema? ResolveSchemaReference(OpenApiSchemaReference schemaRef,
+                                                   IDictionary<string, IOpenApiSchema>? components = null)
+    {
+        if (schemaRef.Target is { } target)
+            return target;
+
+        var refId = schemaRef.GetReferenceId();
+
+        if (string.IsNullOrEmpty(refId) || schemaRef.Reference.IsExternal)
+            return null;
+
+        if (schemaRef.Reference.HostDocument?.Components?.Schemas?.TryGetValue(refId, out var schema) == true)
+            return schema;
+
+        // HostDocument can be unset after document generation (e.g. .http export); fall back to supplied components.
+        if (components is not null && components.TryGetValue(refId, out var componentSchema))
+            return componentSchema;
+
+        return null;
+    }
+
+    static List<JsonNode>? CloneJsonNodeList(IList<JsonNode>? nodes)
+    {
+        if (nodes is null)
+            return null;
+
+        var cloned = new List<JsonNode>(nodes.Count);
+
+        foreach (var node in nodes)
+            cloned.Add(node?.DeepClone()!);
+
+        return cloned;
+    }
+
+    static bool IsSafelyShareable(object value)
+    {
+        var type = value.GetType();
+
+        return type.IsValueType || value is string or Type or Uri;
+    }
+}
+
+readonly record struct OperationSchemaMutationContext(SharedContext SharedContext, OpenApiGenerationState Generation, string OperationKey);
+
+static class OpenApiSchemaReferenceExtensions
+{
+    internal static string? GetReferenceId(this OpenApiSchemaReference schemaRef)
+        => schemaRef.Reference.Id ?? schemaRef.Id;
+
+    /// <summary>
+    /// a reference to <paramref name="refId" /> that keeps the description and examples written next to <paramref name="schemaRef" />.
+    /// a property's xml summary and example live there, not on the shared component.
+    /// </summary>
+    internal static OpenApiSchemaReference RetargetTo(this OpenApiSchemaReference schemaRef, string refId)
+        => new(refId)
+        {
+            Description = schemaRef.Reference.Description,
+            Examples = schemaRef.Reference.Examples?.Select(e => e?.DeepClone()!).ToList()
+        };
+
+    /// <summary>
+    /// copies the description and example a property keeps next to its <c>$ref</c> onto <paramref name="concrete" />,
+    /// a clone of the referenced component that takes the reference's place.
+    /// </summary>
+    internal static void KeepReferenceAnnotations(this OpenApiSchema concrete, IOpenApiSchema? source)
+    {
+        if (source is not OpenApiSchemaReference { Reference: var annotations })
+            return;
+
+        if (annotations.Description is { Length: > 0 } description)
+            concrete.Description = description;
+
+        if (annotations.Examples is { Count: > 0 })
+            concrete.Examples = annotations.Examples.Select(e => e?.DeepClone()!).ToList();
+    }
+}

@@ -1,0 +1,92 @@
+---
+type: Architecture
+title: Architecture
+description: REPR endpoint pipeline, package graph, messaging, auth, and discovery invariants.
+tags: [architecture]
+---
+
+# Architecture
+
+## Style
+- **Library monorepo** of ASP.NET Core packages (not a multi-service deployable).
+- **REPR**: one endpoint class owns Configure + Handle for a request (and optional response) DTO.
+- Vertical-slice friendly: features group Request/Endpoint/Validator/Mapper; no MVC controllers required.
+- Dual registration modes: **reflection scan** (dev default) vs **source-generated type lists** (AOT / trimmed).
+
+## Components
+
+Project references (arrows point to dependencies):
+
+```text
+Library → Attributes, JobQueues, Messaging
+JobQueues → Messaging → Core, Messaging.Core
+CommandRules → JobQueues, Messaging, Messaging.Core
+Security / OpenApi / OData / AspVersioning / Agents.* → Library
+Messaging.Remote → Messaging.Remote.Core → Messaging.Core
+Messaging.Remote.Reflection → Messaging.Remote
+Generator → Attributes
+```
+
+`HealthChecks` and `OpenApi.Kiota` have no project reference to Library. `Generator` is consumed as an analyzer; `Generator.Cli` runs through MSBuild targets.
+
+Package roles: [monorepo-packages.md](monorepo-packages.md). Source locations: [code-map.md](code-map.md).
+
+**Request path (simplified):** `AddFastEndpoints` registers discovery data → `UseFastEndpoints`/`MapFastEndpoints` maps routes → `FeRequestHandler` resolves endpoint instance → bind → validate → pre-processors → (`ResponseStarted` short-circuit) → `OnBeforeHandle` → optional `SkipHandlerIfResponseStarted` short-circuit → `HandleAsync`/`ExecuteAsync` → post-processors → send response.
+
+**Startup/mapping split (`Src/Library/Main/`):** public facades stay on `MainExtensions` (`AddFastEndpoints` / `UseFastEndpoints` / `MapFastEndpoints`, plus internal `BuildRoute` for OpenApi/Agents friend usage). Mapping orchestration is `EndpointRouteMapper`; auth policy materialization is `EndpointSecurityPolicies`; accepts/produces API explorer defaults are `EndpointProducesMetadata`; binder/validator precompile is `EndpointWarmup`. Request execution remains `FeRequestHandler` → `EndpointBootstrap` → `Endpoint.ExecAsync`.
+
+**Discovery ownership:** `AddFastEndpoints` resolves the type list once (`EndpointData.DiscoverTypes` for reflection, or source-generated `DiscoveredTypes`). `EndpointData` builds the HTTP endpoint definition catalog only (`Found`). Messaging handler registration is owned by `MessagingExtensions.RegisterHandlers` into `CommandHandlerRegistry` (same path used by standalone `AddMessaging`). Skip `AddMessaging` when `AddFastEndpoints` already ran; both must not invent a second registration owner.
+
+## OpenAPI validation ownership
+Validation caching/orchestration, rule-tree discovery, application, child scopes, and schema mutation have separate owners. Read [OpenAPI generation and ownership](openapi.md#generation-and-ownership) before changing these boundaries.
+
+## Dependency rules
+- **Allowed:** higher packages reference lower foundation packages (`Attributes`, `Core`, `Messaging.Core`).
+- **Library** references Attributes, JobQueues, Messaging (not Security/OpenApi; those are optional consumer packages).
+- **Security/OpenApi/OData/AspVersioning** reference Library (addons on top of core HTTP).
+- **Generator** references Attributes only (analyzer package); consumers reference Generator as analyzer.
+- **Agents** (`Mcp`, `A2A`) reference Library; share internal types via linked `Src/Agents/Shared/*.cs` (not a separate NuGet).
+- **Agents friend internals:** Library grants `InternalsVisibleTo` to `FastEndpoints.Mcp` / `FastEndpoints.A2A` (`Src/Library/Metadata.cs`). Consumed internals are a binary contract across independently versioned packages; stock in [gotchas.md](gotchas.md).
+- **Forbidden for agents:** invent reverse deps (e.g. Core → Library) or ship Agents.Shared as a public package unless code changes deliberately.
+
+## Communication
+- **HTTP:** endpoints mapped into ASP.NET routing; config via `UseFastEndpoints(c => …)` (`Config` / `Cfg`).
+- **In-process messaging:** command/event/stream handlers registered via `MessagingExtensions.RegisterHandlers` (from `AddMessaging` or as a side path of `AddFastEndpoints`), or DI/test helpers.
+- **Remote:** gRPC handler server (`AddHandlerServer` / remote client connection). The wire format is chosen by an
+  `IRpcMarshallerFactory` and defaults to MessagePack. `AddHandlerServer(marshaller:)` sets it server-side;
+  `RemoteConnection.MarshallerFactory` sets it per client connection. Both sides also take the bound gRPC method name from
+  the factory, so they always agree (MessagePack keeps the historical empty name).
+- **Remote events:** ordinary server-streaming delivery and opt-in durable inbox ACK delivery. Protocol/storage contracts, worker ownership, deadlines, retention and isolation: [remote-events.md](remote-events.md).
+- **Remote reflection:** `FastEndpoints.Messaging.Remote.Reflection` is an opt-in satellite package holding the protobuf wire
+  format and gRPC server reflection (`AddHandlerReflection` / `MapHandlerReflection`). It generates Google.Protobuf descriptors
+  from the command CLR types, so protobuf/reflection dependencies stay out of `Messaging.Remote`.
+- **Jobs:** `AddJobQueues<TJob, TStorage>()` with an app-supplied storage provider. Optional business-key idempotency via `JobQueueOptions.IdempotencyKeyFor`. AOT construction and dedupe traps: [gotchas.md](gotchas.md).
+- **HTTP idempotency:** fingerprint mode is an output-cache policy (`AddIdempotency` + `Idempotency()`). Financial mode is a separate reservation pipeline (`AddFinancialIdempotency` + `UseFinancialIdempotency` + `FinancialIdempotency()`) with `IFinancialIdempotencyStore` (atomic `TryBegin`, ownership-token settlement). Requires a stable caller scope. Do not combine both on one endpoint. Not shared with job-queue `IdempotencyKeyFor`. Settlement and identity traps: [gotchas.md](gotchas.md).
+
+## Persistence
+- Framework does **not** own an app DB. Job queues require consumer `IJobStorageProvider` / `IJobStorageRecord` implementations.
+- Job-queue idempotency rules: [gotchas.md](gotchas.md).
+- No EF/migrations in this repo.
+
+## Security / auth
+- Auth is ASP.NET Core middleware + optional `FastEndpoints.Security` (`Src/Security`): JWT bearer, cookies, refresh, revocation.
+- Endpoint `Configure()`: `AllowAnonymous()`, roles/permissions/policies; `AccessControl(...)` can emit constants via Generator. Global options: `Config.Security`.
+- Feature flags: implement `IFeatureFlag`, call `FeatureFlag<T>()` to disable an endpoint at runtime.
+- Harness wires `AddAuthenticationJwtBearer`, `AdminOnly`, `UseJwtRevocation<T>()`, `UseAntiforgeryFE`. Sample JWT keys are test-only.
+- Remote messaging is trusted-network RPC unless the consumer adds auth.
+- Publish is secretless OIDC ([workflows.md](workflows.md)).
+
+## Invariants
+1. Endpoint types implement `IEndpoint`; public base is `Endpoint<TRequest[, TResponse]>`.
+2. AOT: do **not** rely on reflection discovery; use `AddFastEndpoints(DiscoveredTypes.All)` (+ generator).
+3. Mappers/validators discovered types are typically treated as singletons for performance; no per-request state in mappers.
+4. TFMs, central package versions, and strong-name signing: [dependencies.md](dependencies.md).
+5. Agents addons version independently of core: [monorepo-packages.md](monorepo-packages.md).
+6. Do not rename, retype, or remove Library internals in the Agents friend-assembly stock ([gotchas.md](gotchas.md)) without checking published agent packages and restocking that list.
+
+## Sources
+- `Src/Library/Main/MainExtensions.cs`
+- `Src/Library/Main/EndpointRouteMapper.cs`
+- `Src/Library/Endpoint/Endpoint.cs`
+- `Src/**/*.csproj`
+- `Src/Library/Metadata.cs`

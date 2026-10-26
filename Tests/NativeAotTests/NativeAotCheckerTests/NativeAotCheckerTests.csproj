@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <ItemGroup>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="Always" Visible="false"/>
+        <Content Remove="aot\**"/>
+        <None Remove="aot\**"/>
+    </ItemGroup>
+
+    <PropertyGroup>
+        <RunSmokeTests Condition="'$(RunSmokeTests)' == ''">true</RunSmokeTests> <!-- override to run tests in WAF mode instead of native aot mode -->
+    </PropertyGroup>
+    <ItemGroup Condition="'$(RunSmokeTests)' == 'true'">
+        <RuntimeHostConfigurationOption Include="NativeAotTestMode" Value="true"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\Src\Testing\FastEndpoints.Testing.csproj"/>
+        <ProjectReference Include="..\..\..\TestHarness\NativeAotChecker\NativeAotChecker.csproj"/>
+    </ItemGroup>
+
+</Project>

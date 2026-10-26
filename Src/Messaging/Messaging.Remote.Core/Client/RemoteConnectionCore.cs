@@ -1,0 +1,291 @@
+﻿using System.Collections.Concurrent;
+using Grpc.Core;
+using Grpc.Net.Client;
+using Grpc.Net.Client.Configuration;
+using Grpc.Net.Client.Web;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+namespace FastEndpoints;
+
+/// <summary>
+/// represents a connection to a remote server that hosts command and event handlers
+/// </summary>
+public class RemoteConnectionCore
+{
+    //key: tCommand or tEventHandler
+    //val: remote server that hosts command handlers/event buses
+    internal static ConcurrentDictionary<Type, RemoteConnectionCore> RemoteMap { get; } = new(); //concurrent is needed due to parallel integration tests
+
+    internal static Type StorageRecordType { private get; set; } = typeof(InMemoryEventStorageRecord);
+    internal static Type StorageProviderType { private get; set; } = typeof(InMemoryEventSubscriberStorage);
+    internal static TimeSpan EventRecordExpiry { get; set; } = TimeSpan.FromHours(4);
+
+    //key: tCommand
+    //val: command executor
+    /// <summary />
+    protected readonly Dictionary<Type, ICommandExecutor> ExecutorMap = new();
+
+    /// <summary />
+    protected GrpcChannel? Channel;
+
+    // ReSharper disable once MemberCanBeProtected.Global
+    /// <summary>
+    /// grpc channel settings
+    /// </summary>
+    public GrpcChannelOptions ChannelOptions { get; set; } = new()
+    {
+        ServiceConfig = new()
+        {
+            MethodConfigs =
+            {
+                new()
+                {
+                    Names = { MethodName.Default },
+                    RetryPolicy = new()
+                    {
+                        MaxAttempts = 5, // must be <= MaxRetryAttempts
+                        InitialBackoff = TimeSpan.FromSeconds(1),
+                        MaxBackoff = TimeSpan.FromSeconds(5),
+                        BackoffMultiplier = 1.5,
+                        RetryableStatusCodes = { StatusCode.Unavailable }
+                    }
+                }
+            }
+        },
+        MaxRetryAttempts = 5
+    };
+
+    // ReSharper disable once MemberCanBeProtected.Global
+    /// <summary>
+    /// the address of the remote server
+    /// </summary>
+    public string RemoteAddress { get; }
+
+    /// <summary>
+    /// the default explicit subscriber id to use for event subscriptions on this remote connection when a subscription-specific id is not supplied.
+    /// </summary>
+    public string? SubscriberID { get; set; }
+
+    // ReSharper disable once MemberCanBeProtected.Global
+    /// <summary>
+    /// the wire-format marshaller factory for this connection. defaults to the DI-registered <see cref="IRpcMarshallerFactory" /> or messagepack.
+    /// set this to use a different wire format such as protobuf. it must be set before any command/event is registered, since
+    /// each registration captures the wire format at that moment.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">thrown when set after a command/event has already been registered</exception>
+    public IRpcMarshallerFactory MarshallerFactory
+    {
+        get => _marshallerFactory;
+        set
+        {
+            if (ExecutorMap.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "The wire format must be set before registering commands/events on this connection. Anything already registered would " +
+                    "keep talking the previous format, which the remote server won't understand.");
+            }
+
+            _marshallerFactory = value;
+        }
+    }
+
+    IRpcMarshallerFactory _marshallerFactory = MessagePackMarshallerFactory.Instance;
+
+    readonly IServiceProvider _serviceProvider;
+    readonly CancellationToken _appCancellation;
+    protected readonly string? UnixSocketPath;
+
+    internal RemoteConnectionCore(string address, IServiceProvider serviceProvider)
+    {
+        _serviceProvider = serviceProvider;
+        MarshallerFactory = serviceProvider.GetService<IRpcMarshallerFactory>() ?? MessagePackMarshallerFactory.Instance;
+        _appCancellation = serviceProvider.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None; //could be null on browser
+
+        if (address.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            RemoteAddress = address;
+        else
+        {
+            RemoteAddress = $"http://{address.ToLowerInvariant()}";
+            UnixSocketPath = Path.Combine(Path.GetTempPath(), $"{RemoteAddress[7..]}.sock");
+        }
+
+        var httpMsgHnd = serviceProvider.GetService<HttpMessageHandler>();
+        ChannelOptions.HttpHandler = httpMsgHnd ?? new GrpcWebHandler(new HttpClientHandler()) { GrpcWebMode = GrpcWebMode.GrpcWebText };
+    }
+
+    /// <summary>
+    /// register a "void" command (<see cref="ICommand" />) for this remote connection where the handler for it is hosted/located.
+    /// </summary>
+    /// <typeparam name="TCommand">the type of the command</typeparam>
+    public void Register<TCommand>() where TCommand : class, ICommand
+    {
+        var tCommand = typeof(TCommand);
+        RemoteMap[tCommand] = this;
+        Channel ??= GrpcChannel.ForAddress(RemoteAddress, ChannelOptions);
+        ExecutorMap[tCommand] = new VoidCommandExecutor<TCommand>(Channel, MarshallerFactory);
+    }
+
+    internal Task ExecuteVoid(ICommand cmd, Type tCommand, CallOptions opts)
+        => !ExecutorMap.TryGetValue(tCommand, out var executor)
+               ? throw new InvalidOperationException($"No remote handler has been mapped for the command: [{tCommand.FullName}]")
+               : ((IVoidCommandExecutor)executor).ExecuteVoid(cmd, opts);
+
+    /// <summary>
+    /// register a "unary" command (<see cref="ICommand{TResult}" />) for this remote connection where the handler for it is hosted/located.
+    /// </summary>
+    /// <typeparam name="TCommand">the type of the command</typeparam>
+    /// <typeparam name="TResult">the type of the result</typeparam>
+    public void Register<TCommand, TResult>() where TCommand : class, ICommand<TResult> where TResult : class
+    {
+        var tCommand = typeof(TCommand);
+        RemoteMap[tCommand] = this;
+        Channel ??= GrpcChannel.ForAddress(RemoteAddress, ChannelOptions);
+        ExecutorMap[tCommand] = new UnaryCommandExecutor<TCommand, TResult>(Channel, MarshallerFactory);
+    }
+
+    internal Task<TResult> ExecuteUnary<TResult>(ICommand<TResult> cmd, Type tCommand, CallOptions opts) where TResult : class
+        => !ExecutorMap.TryGetValue(tCommand, out var executor)
+               ? throw new InvalidOperationException($"No remote handler has been mapped for the command: [{tCommand.FullName}]")
+               : ((IUnaryCommandExecutor<TResult>)executor).ExecuteUnary(cmd, opts);
+
+    /// <summary>
+    /// register a "server stream" command (<see cref="IServerStreamCommand{TResult}" />) for this remote connection where the handler for it is hosted/located.
+    /// </summary>
+    /// <typeparam name="TCommand">the type of the command</typeparam>
+    /// <typeparam name="TResult">the type of the result stream</typeparam>
+    public void RegisterServerStream<TCommand, TResult>() where TCommand : class, IServerStreamCommand<TResult> where TResult : class
+    {
+        var tCommand = typeof(TCommand);
+        RemoteMap[tCommand] = this;
+        Channel ??= GrpcChannel.ForAddress(RemoteAddress, ChannelOptions);
+        ExecutorMap[tCommand] = new ServerStreamCommandExecutor<TCommand, TResult>(Channel, MarshallerFactory);
+    }
+
+    internal IAsyncStreamReader<TResult> ExecuteServerStream<TResult>(IServerStreamCommand<TResult> cmd, Type tCommand, CallOptions opts)
+        where TResult : class
+        => !ExecutorMap.TryGetValue(tCommand, out var executor)
+               ? throw new InvalidOperationException($"No remote handler has been mapped for the command: [{tCommand.FullName}]")
+               : ((IServerStreamCommandExecutor<TResult>)executor).ExecuteServerStream(cmd, opts);
+
+    /// <summary>
+    /// register a remote handler for a "client stream" (<see cref="IAsyncEnumerable{T}" />) for this remote connection.
+    /// </summary>
+    /// <typeparam name="T">the type of the items in the stream</typeparam>
+    /// <typeparam name="TResult">the type of the result that will be received when the stream ends</typeparam>
+    public void RegisterClientStream<T, TResult>() where T : class where TResult : class
+    {
+        var tCommand = typeof(IAsyncEnumerable<T>);
+        RemoteMap[tCommand] = this;
+        Channel ??= GrpcChannel.ForAddress(RemoteAddress, ChannelOptions);
+        ExecutorMap[tCommand] = new ClientStreamCommandExecutor<T, TResult>(Channel, MarshallerFactory);
+    }
+
+    internal Task<TResult> ExecuteClientStream<T, TResult>(IAsyncEnumerable<T> cmd, Type tCommand, CallOptions opts) where T : class where TResult : class
+        => !ExecutorMap.TryGetValue(tCommand, out var executor)
+               ? throw new InvalidOperationException($"No remote handler has been mapped for the command: [{tCommand.FullName}]")
+               : ((IClientStreamCommandExecutor<T, TResult>)executor).ExecuteClientStream(cmd, opts);
+
+    /// <summary>
+    /// subscribe to a broadcast channel for a given event type (<typeparamref name="TEvent" />) on the remote host.
+    /// the received events will be handled by the specified handler (<typeparamref name="TEventHandler" />) on this machine.
+    /// </summary>
+    /// <typeparam name="TEvent">the type of the events that will be received</typeparam>
+    /// <typeparam name="TEventHandler">the handler that will be handling the received events</typeparam>
+    /// <param name="ct">cancellation token</param>
+    /// <param name="clientIdentifier">
+    /// a unique identifier for this client. this will be used to create a durable subscriber id which will allow the server to
+    /// uniquely identify this subscriber/client across disconnections. if you don't set this value, only one subscriber from a single machine is possible.
+    /// i.e. if you spin up multiple instances of this subscriber they will all connect to the server with the same subscriber id, which will result in
+    /// unpredictable event receiving behavior.
+    /// </param>
+    public void Subscribe<TEvent, TEventHandler>(CancellationToken ct, string clientIdentifier = "default")
+        where TEvent : class, IEvent
+        where TEventHandler : IEventHandler<TEvent>
+        => SubscribeCore<TEvent, TEventHandler>(new(cancellationToken: ct), clientIdentifier, null);
+
+    /// <summary>
+    /// subscribe to a broadcast channel for a given event type (<typeparamref name="TEvent" />) on the remote host.
+    /// the received events will be handled by the specified handler (<typeparamref name="TEventHandler" />) on this machine.
+    /// </summary>
+    /// <typeparam name="TEvent">the type of the events that will be received</typeparam>
+    /// <typeparam name="TEventHandler">the handler that will be handling the received events</typeparam>
+    /// <param name="callOptions">the call options</param>
+    /// <param name="clientIdentifier">
+    /// a unique identifier for this client. this will be used to create a durable subscriber id which will allow the server to
+    /// uniquely identify this subscriber/client across disconnections. if you don't set this value, only one subscriber from a single machine is possible.
+    /// i.e. if you spin up multiple instances of this subscriber they will all connect to the server with the same subscriber id, which will result in
+    /// unpredictable event receiving behavior.
+    /// </param>
+    public void Subscribe<TEvent, TEventHandler>(CallOptions callOptions = default, string clientIdentifier = "default")
+        where TEvent : class, IEvent
+        where TEventHandler : IEventHandler<TEvent>
+        => SubscribeCore<TEvent, TEventHandler>(callOptions, clientIdentifier, null);
+
+    /// <summary>
+    /// subscribe to a broadcast channel using an explicit subscriber id instead of the default derived identity.
+    /// </summary>
+    /// <typeparam name="TEvent">the type of the events that will be received</typeparam>
+    /// <typeparam name="TEventHandler">the handler that will be handling the received events</typeparam>
+    /// <param name="subscriberID">
+    /// an explicit subscriber id to use as-is. this is useful when the hub is configured with a known list of subscriber ids
+    /// and should start queuing events for this subscriber before it first connects. explicit ids can be reused across
+    /// different event types because pending-record lookups are scoped by both subscriber id and event type.
+    /// </param>
+    /// <param name="ct">cancellation token</param>
+    public void SubscribeWithExplicitId<TEvent, TEventHandler>(string subscriberID, CancellationToken ct = default)
+        where TEvent : class, IEvent
+        where TEventHandler : IEventHandler<TEvent>
+        => SubscribeCore<TEvent, TEventHandler>(new(cancellationToken: ct), clientIdentifier: "default", subscriberID);
+
+    /// <summary>
+    /// subscribe to a broadcast channel using an explicit subscriber id instead of the default derived identity.
+    /// </summary>
+    /// <typeparam name="TEvent">the type of the events that will be received</typeparam>
+    /// <typeparam name="TEventHandler">the handler that will be handling the received events</typeparam>
+    /// <param name="subscriberID">
+    /// an explicit subscriber id to use as-is. this is useful when the hub is configured with a known list of subscriber ids
+    /// and should start queuing events for this subscriber before it first connects. explicit ids can be reused across
+    /// different event types because pending-record lookups are scoped by both subscriber id and event type.
+    /// </param>
+    /// <param name="callOptions">the call options</param>
+    public void SubscribeWithExplicitId<TEvent, TEventHandler>(string subscriberID, CallOptions callOptions)
+        where TEvent : class, IEvent
+        where TEventHandler : IEventHandler<TEvent>
+        => SubscribeCore<TEvent, TEventHandler>(callOptions, clientIdentifier: "default", subscriberID);
+
+    void SubscribeCore<TEvent, TEventHandler>(CallOptions callOptions, string clientIdentifier, string? subscriberID)
+        where TEvent : class, IEvent
+        where TEventHandler : IEventHandler<TEvent>
+    {
+        var tEventHandler = typeof(TEventHandler);
+        RemoteMap[tEventHandler] = this;
+
+        Channel ??= GrpcChannel.ForAddress(RemoteAddress, ChannelOptions);
+
+        var tHandler = _serviceProvider.GetService<IEventHandler<TEvent>>()?.GetType() ?? typeof(TEventHandler);
+        // opt-in is per provider type. an ack provider never falls back to the sub stream.
+        var subscriberType = typeof(IEventSubscriberDeliveryAck<>).MakeGenericType(StorageRecordType).IsAssignableFrom(StorageProviderType)
+                                 ? typeof(EventDeliveryAckSubscriber<,,,>)
+                                 : typeof(EventSubscriber<,,,>);
+        var tEventSubscriber = subscriberType.MakeGenericType(typeof(TEvent), tHandler, StorageRecordType, StorageProviderType);
+        var effectiveSubscriberID = subscriberID ?? SubscriberID;
+        var eventSubscriber = (ICommandExecutor)(effectiveSubscriberID is null
+                                                     ? ActivatorUtilities.CreateInstance(_serviceProvider, tEventSubscriber, Channel!, clientIdentifier, MarshallerFactory)
+                                                     : ActivatorUtilities.CreateInstance(
+                                                         _serviceProvider,
+                                                         tEventSubscriber,
+                                                         Channel!,
+                                                         clientIdentifier,
+                                                         effectiveSubscriberID,
+                                                         MarshallerFactory));
+
+        ExecutorMap[tEventHandler] = eventSubscriber;
+
+        ((IEventSubscriber)eventSubscriber).Start(
+            callOptions.WithCancellationToken(
+                CancellationTokenSource.CreateLinkedTokenSource( //combine with app shutdown token
+                    _appCancellation,
+                    callOptions.CancellationToken).Token));
+    }
+}

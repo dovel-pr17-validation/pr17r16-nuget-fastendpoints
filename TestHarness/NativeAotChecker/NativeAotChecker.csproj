@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <NoDefaultLaunchSettingsFile>true</NoDefaultLaunchSettingsFile>
+        <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <PublishAot>true</PublishAot>
+        <IsPackable>false</IsPackable>
+
+        <GenerateSerializerContexts>true</GenerateSerializerContexts>
+        <SerializerContextOutputPath>obj/$(Configuration)/$(TargetFramework)/SerializerCtx</SerializerContextOutputPath>
+
+        <ExportOpenApiDocs>true</ExportOpenApiDocs>
+        <ExportHttpFiles>true</ExportHttpFiles>
+        <OpenApiExportPath>wwwroot/openapi</OpenApiExportPath>
+    </PropertyGroup>
+
+    <Import Project="..\..\Src\Generator\FastEndpoints.Generator.targets"/><!-- only needed for project references -->
+    <Import Project="..\..\Src\OpenApi\FastEndpoints.OpenApi.targets"/><!-- only needed for project references -->
+
+    <!-- Generated contexts are isolated per target and included after generation on a clean build. -->
+    <Target Name="IncludeSerializerContexts" BeforeTargets="CoreCompile" DependsOnTargets="GenerateFastEndpointsSerializerContexts">
+        <ItemGroup>
+            <Compile Include="$(SerializerContextOutputPath)/**/*.cs"/>
+        </ItemGroup>
+    </Target>
+
+    <ItemGroup>
+        <Compile Remove="Generated/**/*.cs"/>
+        <None Remove="NativeAotChecker.csproj.DotSettings"/>
+        <Content Remove="aot\**"/>
+        <None Remove="aot\**"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- <PackageReference Include="FastEndpoints" VersionOverride="7.3.0-beta.13"/> -->
+        <!-- <PackageReference Include="FastEndpoints.Generator" VersionOverride="7.3.0-beta.13" PrivateAssets="all" IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive"/> -->
+        <!-- <PackageReference Include="FastEndpoints.Security" VersionOverride="7.3.0-beta.13"/> -->
+        <PackageReference Include="Scalar.AspNetCore"/>
+
+        <ProjectReference Include="..\..\Src\Generator\FastEndpoints.Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false"/>
+        <ProjectReference Include="..\..\Src\Library\FastEndpoints.csproj"/>
+        <ProjectReference Include="..\..\Src\CommandRules\FastEndpoints.CommandRules.csproj"/>
+        <ProjectReference Include="..\..\Src\Security\FastEndpoints.Security.csproj"/>
+        <ProjectReference Include="..\..\Src\OpenApi\FastEndpoints.OpenApi.csproj"/>
+        <ProjectReference Include="..\Sandbox\Contracts\Contracts.csproj"/>
+    </ItemGroup>
+
+</Project>

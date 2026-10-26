@@ -1,0 +1,28 @@
+<Solution>
+  <Folder Name="/REFs/">
+    <Project Path="Src/Attributes/FastEndpoints.Attributes.csproj" />
+    <Project Path="Src/CommandRules/FastEndpoints.CommandRules.csproj" />
+    <Project Path="Src/Core/FastEndpoints.Core.csproj" />
+    <Project Path="Src/Generator.Cli/FastEndpoints.Generator.Cli.csproj" />
+    <Project Path="Src/Generator/FastEndpoints.Generator.csproj" />
+    <Project Path="Src/JobQueues/FastEndpoints.JobQueues.csproj" />
+    <Project Path="Src/Library/FastEndpoints.csproj" />
+    <Project Path="Src/Messaging/Messaging.Core/FastEndpoints.Messaging.Core.csproj" />
+    <Project Path="Src/Messaging/Messaging/FastEndpoints.Messaging.csproj" />
+    <Project Path="Src/OpenApi/FastEndpoints.OpenApi.csproj" />
+    <Project Path="Src/Security/FastEndpoints.Security.csproj" />
+    <Project Path="Src/Testing/FastEndpoints.Testing.csproj" />
+    <Project Path="TestHarness/Sandbox/Contracts/Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/" />
+  <Folder Name="/Solution Items/Main/">
+    <File Path="Directory.Packages.props" />
+    <File Path="Src\Directory.Build.props" />
+  </Folder>
+  <Folder Name="/Solution Items/Tests/">
+    <File Path="Tests/Directory.Build.props" />
+  </Folder>
+  <Project Path="TestHarness/NativeAotChecker/NativeAotChecker.csproj" />
+  <Project Path="Tests/NativeAotTests/NativeAotCheckerTests/NativeAotCheckerTests.csproj" />
+  
+</Solution>

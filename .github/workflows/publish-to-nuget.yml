@@ -1,0 +1,63 @@
+name: Publish Nuget Package
+
+on:
+  push:
+    tags:
+      - v*
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for NuGet trusted publishing
+      contents: write # create GitHub Release
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Setup .Net SDK for All Versions
+        uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: |
+            10.x
+          global-json-file: global.json
+
+      - name: Modify xUnit Runner Config
+        run: |
+          echo '{
+            "parallelizeAssembly": false,
+            "parallelizeTestCollections": false,
+            "diagnosticMessages": false
+          }' > Tests/IntegrationTests/FastEndpoints/xunit.runner.json
+
+      - name: Run .NET 10 Tests
+        run: dotnet test FastEndpoints.slnx -c Release --framework net10.0 --verbosity minimal --filter "ExcludeInCiCd!=Yes" --max-parallel-test-modules 1
+
+      - name: Run .NET 11 Tests
+        run: dotnet test FastEndpoints.slnx -c Release --framework net11.0 --verbosity minimal --filter "ExcludeInCiCd!=Yes" --max-parallel-test-modules 1
+
+      # AOT tests disabled to keep publishing CI duration manageable.
+      # - name: Run .NET 10 AOT Tests
+      #   run: dotnet test NativeAot.slnx -c Release --framework net10.0 --verbosity minimal --max-parallel-test-modules 1
+
+      # - name: Run .NET 11 AOT Tests
+      #   run: dotnet test NativeAot.slnx -c Release --framework net11.0 --verbosity minimal --max-parallel-test-modules 1
+
+      - name: Make Nuget Packages
+        run: dotnet pack FastEndpoints.slnx -c Release
+
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1.2.0
+        id: login
+        with:
+          user: djnitehawk # nuget.org username (not github)
+
+      - name: Publish To Nuget
+        run: dotnet nuget push "Src/**/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2.3.2
+        if: ${{ !contains(github.ref, 'beta') }}
+        with:
+          draft: false
+          name: ${{ github.ref_name }} Release
+          body_path: Src/Library/changelog.md

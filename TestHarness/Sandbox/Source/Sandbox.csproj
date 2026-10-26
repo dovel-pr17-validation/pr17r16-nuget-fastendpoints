@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <OutputType>Exe</OutputType>
+        <NoWarn>CS1591;CA2016</NoWarn>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <LangVersion>latest</LangVersion>
+        <RootNamespace>Sand_Box</RootNamespace>
+
+        <!-- <GenerateSerializerContexts>true</GenerateSerializerContexts> -->
+    </PropertyGroup>
+
+    <!-- &lt;!&ndash; only needed for project references &ndash;&gt; -->
+    <!-- <Import Project="..\..\Src\Generator\FastEndpoints.Generator.targets"/> -->
+
+    <ItemGroup>
+        <PackageReference Include="Scalar.AspNetCore"/>
+        <ProjectReference Include="..\..\..\Src\CommandRules\FastEndpoints.CommandRules.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Library\FastEndpoints.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Attributes\FastEndpoints.Attributes.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Generator\FastEndpoints.Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false"/>
+        <ProjectReference Include="..\..\..\Src\OpenApi\FastEndpoints.OpenApi.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Security\FastEndpoints.Security.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Include="wwwroot\index.html"/>
+    </ItemGroup>
+
+</Project>

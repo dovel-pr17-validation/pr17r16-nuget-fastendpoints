@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\Src\Library\FastEndpoints.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Messaging\Messaging.Remote.Reflection\FastEndpoints.Messaging.Remote.Reflection.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Messaging\Messaging.Remote.Testing\FastEndpoints.Messaging.Remote.Testing.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Testing\FastEndpoints.Testing.csproj"/>
+        <ProjectReference Include="..\..\..\TestHarness\Web\Web.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="Always"/>
+        <Content Include="test.png" CopyToOutputDirectory="Always"/>
+    </ItemGroup>
+
+</Project>

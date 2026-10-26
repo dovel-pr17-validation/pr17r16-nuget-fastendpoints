@@ -1,0 +1,190 @@
+using System.Security.Claims;
+using FastEndpoints.Mcp;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Options;
+using ModelContextProtocol;
+using ModelContextProtocol.Protocol;
+using ModelContextProtocol.Server;
+
+#pragma warning disable CS8618
+
+namespace FastEndpoints.Agents.Tests;
+
+public class McpToolDuplicateNameTests
+{
+    [Fact]
+    public void Duplicate_visible_tool_names_fail_fast_during_build()
+    {
+        using var provider = BuildServices((_, _, _) => true, includeSecondDuplicate: true, secondDuplicateVisible: true);
+        var source = provider.GetRequiredService<EndpointMcpToolSource>();
+
+        var ex = Should.Throw<InvalidOperationException>(source.BuildTools);
+
+        ex.Message.ShouldContain("Duplicate MCP tool names detected");
+        ex.Message.ShouldContain("'shared_tool'");
+        ex.Message.ShouldContain(typeof(VisibleDuplicateToolEndpoint).FullName!);
+        ex.Message.ShouldContain(typeof(SecondDuplicateToolEndpoint).FullName!);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Hidden_duplicate_does_not_shadow_visible_tool(bool audit)
+    {
+        using var provider = BuildServices(HideSecondDuplicate, includeSecondDuplicate: true, secondDuplicateVisible: false);
+        SetUser(provider, true);
+        var refusals = 0;
+        provider.GetRequiredService<McpOptions>().OnToolCallRefused = audit ? (_, _, _) => refusals++ : null;
+
+        var listed = await ListTools(provider, authenticated: true);
+        listed.Tools.Select(t => t.Name).ShouldBe(["shared_tool"]);
+
+        var result = await CallTool(provider, "shared_tool", authenticated: true);
+
+        ((TextContentBlock)result.Content[0]).Text.ShouldContain("visible:ping");
+        ((TextContentBlock)result.Content[0]).Text.ShouldNotContain("duplicate:ping");
+        refusals.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task All_hidden_duplicates_report_only_one_refusal()
+    {
+        using var provider = BuildServices((_, _, _) => false, includeSecondDuplicate: true, secondDuplicateVisible: false);
+        SetUser(provider, true);
+        var refusals = new List<EndpointDefinition>();
+        provider.GetRequiredService<McpOptions>().OnToolCallRefused = (def, _, _) => refusals.Add(def);
+
+        var ex = await Should.ThrowAsync<McpException>(async () => await CallTool(provider, "shared_tool", authenticated: true));
+
+        ex.Message.ShouldBe("Tool 'shared_tool' is not available for the current caller.");
+        refusals.ShouldHaveSingleItem().ShouldBeSameAs(provider.GetRequiredService<EndpointData>().Found.First());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Multiple_visible_duplicates_do_not_resolve_arbitrarily_on_call_or_list(bool audit)
+    {
+        using var provider = BuildServices((_, _, _) => true, includeSecondDuplicate: true, secondDuplicateVisible: true);
+        SetUser(provider, true);
+        provider.GetRequiredService<McpOptions>().OnToolCallRefused = audit ? static (_, _, _) => { } : null;
+
+        var options = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+
+        var listEx = await Should.ThrowAsync<InvalidOperationException>(
+                         async () =>
+                             await options.Handlers.ListToolsHandler!(
+                                 McpToolVisibilityTestsBridge.BuildListRequestContext(provider, BuildPrincipal(true)),
+                                 CancellationToken.None));
+
+        listEx.Message.ShouldContain("Duplicate MCP tool names detected");
+        listEx.Message.ShouldContain("'shared_tool'");
+
+        var callEx = await Should.ThrowAsync<InvalidOperationException>(
+                         async () =>
+                             await options.Handlers.CallToolHandler!(
+                                 McpToolVisibilityTestsBridge.BuildCallRequestContext(provider, "shared_tool", BuildPrincipal(true)),
+                                 CancellationToken.None));
+
+        callEx.Message.ShouldContain("Duplicate MCP tool name 'shared_tool'");
+    }
+
+    static ServiceProvider BuildServices(Func<EndpointDefinition, ClaimsPrincipal, HttpContext, bool> visibilityFilter,
+                                         bool includeSecondDuplicate,
+                                         bool secondDuplicateVisible)
+    {
+        Factory.RegisterTestServices(
+            s =>
+            {
+                s.AddSingleton(typeof(IRequestBinder<>), typeof(RequestBinder<>));
+            });
+
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddHttpContextAccessor();
+        var types = includeSecondDuplicate
+                        ? new List<Type> { typeof(VisibleDuplicateToolEndpoint), typeof(SecondDuplicateToolEndpoint) }
+                        : new List<Type> { typeof(VisibleDuplicateToolEndpoint) };
+        services.AddFastEndpoints(types);
+        services.AddMcp(o => o.ToolVisibilityFilter = visibilityFilter);
+
+        var provider = services.BuildServiceProvider();
+
+        foreach (var def in provider.GetRequiredService<EndpointData>().Found)
+        {
+            if (def.EndpointType == typeof(VisibleDuplicateToolEndpoint))
+                def.McpTool("shared_tool");
+
+            if (includeSecondDuplicate && def.EndpointType == typeof(SecondDuplicateToolEndpoint))
+            {
+                def.McpTool(
+                    "shared_tool",
+                    configure: info =>
+                               {
+                                   info.Title = secondDuplicateVisible ? "Second Visible Duplicate" : "Hidden Duplicate";
+                               });
+            }
+        }
+
+        return provider;
+    }
+
+    static async Task<ListToolsResult> ListTools(IServiceProvider provider, bool authenticated)
+    {
+        var options = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+
+        return await options.Handlers.ListToolsHandler!(McpToolVisibilityTestsBridge.BuildListRequestContext(provider, BuildPrincipal(authenticated)), CancellationToken.None);
+    }
+
+    static async Task<CallToolResult> CallTool(IServiceProvider provider, string toolName, bool authenticated)
+    {
+        var options = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+
+        return await options.Handlers.CallToolHandler!(
+                   McpToolVisibilityTestsBridge.BuildCallRequestContext(provider, toolName, BuildPrincipal(authenticated)),
+                   CancellationToken.None);
+    }
+
+    static ClaimsPrincipal BuildPrincipal(bool authenticated)
+        => authenticated
+               ? new(new ClaimsIdentity([new("sub", "caller")], "test"))
+               : new(new ClaimsIdentity());
+
+    static void SetUser(IServiceProvider provider, bool authenticated)
+    {
+        provider.GetRequiredService<IHttpContextAccessor>().HttpContext = new DefaultHttpContext
+        {
+            RequestServices = provider,
+            User = BuildPrincipal(authenticated)
+        };
+    }
+
+    static bool HideSecondDuplicate(EndpointDefinition def, ClaimsPrincipal _, HttpContext __)
+        => def.EndpointType != typeof(SecondDuplicateToolEndpoint);
+
+    [HttpPost("/visible-duplicate-tool")]
+    sealed class VisibleDuplicateToolEndpoint : Endpoint<ToolRequest, ToolResponse>
+    {
+        public override Task HandleAsync(ToolRequest req, CancellationToken ct)
+            => Send.OkAsync(new() { Value = "visible:" + req.Value }, ct);
+    }
+
+    [HttpPost("/second-duplicate-tool")]
+    sealed class SecondDuplicateToolEndpoint : Endpoint<ToolRequest, ToolResponse>
+    {
+        public override Task HandleAsync(ToolRequest req, CancellationToken ct)
+            => Send.OkAsync(new() { Value = "duplicate:" + req.Value }, ct);
+    }
+
+    // ReSharper disable once ClassNeverInstantiated.Local
+    sealed class ToolRequest
+    {
+        public string Value { get; set; }
+    }
+
+    sealed class ToolResponse
+    {
+        public string? Value { get; set; }
+    }
+}

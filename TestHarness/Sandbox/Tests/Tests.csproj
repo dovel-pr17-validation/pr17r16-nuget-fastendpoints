@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <RootNamespace>Tests</RootNamespace>
+        <OutputType>Exe</OutputType>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\Src\Generator\FastEndpoints.Generator.csproj"/>
+        <ProjectReference Include="..\..\..\Src\Testing\FastEndpoints.Testing.csproj"/>
+        <PackageReference Include="FakeItEasy"/>
+        <PackageReference Include="Shouldly"/>
+        <PackageReference Include="xunit.v3"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Source\Sandbox.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="Always"/>
+    </ItemGroup>
+
+</Project>
